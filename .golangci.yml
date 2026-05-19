@@ -16,6 +16,11 @@ linters:
       enable-all: true
       disable:
         - fieldalignment
+    errcheck:
+      exclude-functions:
+        - (*net/http.Response).Body.Close
+        - (io.ReadCloser).Close
+        - (io.Closer).Close
   exclusions:
     rules:
       - path: _test\.go

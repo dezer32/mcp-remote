@@ -163,7 +163,7 @@ func (c *Client) sendOnce(ctx context.Context, body []byte, out chan<- proxy.Mes
 		c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
 		return
 	}
-	if err := c.setRequestHeaders(ctx, req, true); err != nil {
+	if err = c.setRequestHeaders(ctx, req, true); err != nil {
 		c.emitErr(ctx, out, err)
 		return
 	}
@@ -274,7 +274,7 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
 			return
 		}
-		if err := c.setRequestHeaders(ctx, req, false); err != nil {
+		if err = c.setRequestHeaders(ctx, req, false); err != nil {
 			c.emitErr(ctx, out, err)
 			return
 		}
@@ -392,7 +392,7 @@ func (c *Client) Close(ctx context.Context) error {
 		c.log.Warn("close: new request", slog.String("err", err.Error()))
 		return nil
 	}
-	if err := c.setRequestHeaders(delCtx, req, false); err != nil {
+	if err = c.setRequestHeaders(delCtx, req, false); err != nil {
 		c.log.Warn("close: set headers", slog.String("err", err.Error()))
 		return nil
 	}

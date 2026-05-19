@@ -178,7 +178,7 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 	p.cachedMeta = meta
 	p.cachedResource = resource
 	if p.storage != nil {
-		if err := p.storage.SaveMetadata(meta, resource); err != nil {
+		if err = p.storage.SaveMetadata(meta, resource); err != nil {
 			p.log.Warn("oauth: save metadata", slog.String("error", err.Error()))
 		}
 	}
@@ -208,13 +208,14 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 
 	// 4) DCR (если cachedClient ещё пуст и есть registration endpoint).
 	if p.cachedClient == nil && meta.RegistrationEndpoint != "" {
-		client, err := p.registerClient(ctx, meta.RegistrationEndpoint, callbackURL)
+		var client *ClientInfo
+		client, err = p.registerClient(ctx, meta.RegistrationEndpoint, callbackURL)
 		if err != nil {
 			return fmt.Errorf("oauth: dynamic client registration: %w", err)
 		}
 		p.cachedClient = client
 		if p.storage != nil {
-			if err := p.storage.SaveClient(client); err != nil {
+			if err = p.storage.SaveClient(client); err != nil {
 				p.log.Warn("oauth: save client", slog.String("error", err.Error()))
 			}
 		}
@@ -227,7 +228,7 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 	authURL := buildAuthorizeURL(meta, p.cachedClient, callbackURL, challenge, state, resource)
 	p.log.Info("oauth: opening browser for authorization", slog.String("url", authURL))
 
-	if err := p.opener.Open(ctx, authURL); err != nil {
+	if err = p.opener.Open(ctx, authURL); err != nil {
 		// Не фатально: пользователь может открыть URL вручную. Логируем и
 		// печатаем URL в stderr.
 		p.log.Warn("oauth: opener failed", slog.String("error", err.Error()))

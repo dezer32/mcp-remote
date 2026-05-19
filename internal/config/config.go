@@ -219,9 +219,9 @@ func Parse(args []string) (*Config, error) {
 	if rawURL == "" {
 		return nil, errors.New("ServerURL required")
 	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse ServerURL %q: %w", rawURL, err)
+	u, urlErr := url.Parse(rawURL)
+	if urlErr != nil {
+		return nil, fmt.Errorf("parse ServerURL %q: %w", rawURL, urlErr)
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("parse ServerURL %q: scheme and host required", rawURL)
@@ -258,6 +258,7 @@ func Parse(args []string) (*Config, error) {
 		cfg.AuthTimeout = d
 	}
 
+	var err error
 	if cfg.StaticOAuthClientMetadataJSON, err = loadJSONFlag(staticMeta, "--static-oauth-client-metadata"); err != nil {
 		return nil, err
 	}

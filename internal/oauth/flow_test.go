@@ -57,7 +57,6 @@ type asFixture struct {
 
 type codeInfo struct {
 	clientID    string
-	verifier    string
 	challenge   string
 	redirectURI string
 	resource    string

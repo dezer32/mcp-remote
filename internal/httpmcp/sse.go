@@ -81,10 +81,7 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- proxy.MessageOrErr
 		var field, value string
 		if idx := strings.IndexByte(line, ':'); idx >= 0 {
 			field = line[:idx]
-			value = line[idx+1:]
-			if strings.HasPrefix(value, " ") {
-				value = value[1:]
-			}
+			value = strings.TrimPrefix(line[idx+1:], " ")
 		} else {
 			field = line
 			value = ""

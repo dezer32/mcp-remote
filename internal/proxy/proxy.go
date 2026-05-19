@@ -483,6 +483,7 @@ func (p *Proxy) runListener(ctx context.Context, _ *sync.WaitGroup) {
 		// При session-lost ждём пока recovery завершится прежде чем reopen.
 		// Берём RLock — он не выдадут пока recovery держит Lock.
 		p.recoveryMu.RLock()
+		//nolint:staticcheck // намеренный barrier: RLock/RUnlock — это ожидание окончания recovery, не критическая секция.
 		p.recoveryMu.RUnlock()
 		// recovery-fail могла произойти — проверим.
 		select {
