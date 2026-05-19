@@ -1,0 +1,4 @@
+mcp-remote
+*.test
+coverage.out
+/dist/
