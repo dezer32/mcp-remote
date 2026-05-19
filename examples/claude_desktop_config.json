@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "example-bearer": {
+      "command": "/usr/local/bin/mcp-remote",
+      "args": [
+        "https://api.example.com/mcp",
+        "--header",
+        "Authorization:Bearer ${TOKEN}"
+      ],
+      "env": {
+        "TOKEN": "your-token-here"
+      }
+    },
+    "example-oauth": {
+      "command": "/usr/local/bin/mcp-remote",
+      "args": [
+        "https://oauth-mcp.example.com/mcp"
+      ]
+    }
+  }
+}
