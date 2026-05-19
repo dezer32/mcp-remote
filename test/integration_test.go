@@ -341,7 +341,7 @@ func TestIntegration_Basic(t *testing.T) {
 	cfgDir := t.TempDir()
 	home := t.TempDir()
 	h := startProxy(t, bin,
-		[]string{srv.URL + "/mcp"},
+		[]string{"--allow-http", srv.URL + "/mcp"},
 		[]string{
 			"MCP_REMOTE_CONFIG_DIR=" + cfgDir,
 			"HOME=" + home,
@@ -401,7 +401,7 @@ func TestIntegration_SessionRecovery(t *testing.T) {
 	cfgDir := t.TempDir()
 	home := t.TempDir()
 	h := startProxy(t, bin,
-		[]string{srv.URL + "/mcp"},
+		[]string{"--allow-http", srv.URL + "/mcp"},
 		[]string{
 			"MCP_REMOTE_CONFIG_DIR=" + cfgDir,
 			"HOME=" + home,
@@ -448,6 +448,7 @@ func TestIntegration_StaticHeaderAuth(t *testing.T) {
 	// открыть браузер, тест должен зафейлиться по таймауту.
 	h := startProxy(t, bin,
 		[]string{
+			"--allow-http",
 			srv.URL + "/mcp",
 			"--header", "Authorization: Bearer hardcoded-token",
 		},
@@ -486,7 +487,7 @@ func TestIntegration_OAuth(t *testing.T) {
 	cfgDir := t.TempDir()
 	home := t.TempDir()
 	h := startProxy(t, bin,
-		[]string{srv.URL + "/mcp"},
+		[]string{"--allow-http", srv.URL + "/mcp"},
 		[]string{
 			"BROWSER=" + helper,
 			"MCP_REMOTE_CONFIG_DIR=" + cfgDir,
