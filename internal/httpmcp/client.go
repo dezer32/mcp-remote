@@ -186,30 +186,14 @@ func (c *Client) sendOnce(ctx context.Context, body []byte, out chan<- proxy.Mes
 		return
 
 	case http.StatusUnauthorized:
-		www := resp.Header.Get("WWW-Authenticate")
-		drainAndClose(resp.Body)
-		if retried {
-			c.emitErr(ctx, out, fmt.Errorf("http 401 after retry"))
-			return
-		}
-		if c.tp == nil {
-			c.emitErr(ctx, out, fmt.Errorf("http 401: no token provider"))
-			return
-		}
-		if err := c.tp.HandleUnauthorized(ctx, www); err != nil {
-			c.emitErr(ctx, out, fmt.Errorf("handle unauthorized: %w", err))
+		if !c.handle401(ctx, resp, retried, out) {
 			return
 		}
 		c.sendOnce(ctx, body, out, true)
 		return
 
 	case http.StatusNotFound:
-		drainAndClose(resp.Body)
-		if c.session.getSessionID() != "" {
-			c.emitErr(ctx, out, proxy.ErrSessionLost)
-			return
-		}
-		c.emitErr(ctx, out, fmt.Errorf("http 404"))
+		c.emit404(ctx, resp, out)
 		return
 
 	default:
@@ -317,30 +301,14 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			return
 
 		case http.StatusUnauthorized:
-			www := resp.Header.Get("WWW-Authenticate")
-			drainAndClose(resp.Body)
-			if retried401 {
-				c.emitErr(ctx, out, fmt.Errorf("http 401 after retry"))
-				return
-			}
-			if c.tp == nil {
-				c.emitErr(ctx, out, fmt.Errorf("http 401: no token provider"))
-				return
-			}
-			if err := c.tp.HandleUnauthorized(ctx, www); err != nil {
-				c.emitErr(ctx, out, fmt.Errorf("handle unauthorized: %w", err))
+			if !c.handle401(ctx, resp, retried401, out) {
 				return
 			}
 			retried401 = true
 			continue
 
 		case http.StatusNotFound:
-			drainAndClose(resp.Body)
-			if c.session.getSessionID() != "" {
-				c.emitErr(ctx, out, proxy.ErrSessionLost)
-				return
-			}
-			c.emitErr(ctx, out, fmt.Errorf("http 404"))
+			c.emit404(ctx, resp, out)
 			return
 
 		case http.StatusOK:
@@ -443,6 +411,38 @@ func (c *Client) Close(ctx context.Context) error {
 		c.log.Warn("close: non-2xx", slog.Int("status", resp.StatusCode))
 	}
 	return nil
+}
+
+// handle401 — общая обработка 401: парс WWW-Authenticate, вызов tp.HandleUnauthorized,
+// emit ошибки на провал. Закрывает resp.Body. Возвращает true если caller-у можно
+// повторить запрос (один раз — retried контролирует), иначе false (ошибка уже emit-нута).
+func (c *Client) handle401(ctx context.Context, resp *http.Response, retried bool, out chan<- proxy.MessageOrError) bool {
+	www := resp.Header.Get("WWW-Authenticate")
+	drainAndClose(resp.Body)
+	if retried {
+		c.emitErr(ctx, out, fmt.Errorf("http 401 after retry"))
+		return false
+	}
+	if c.tp == nil {
+		c.emitErr(ctx, out, fmt.Errorf("http 401: no token provider"))
+		return false
+	}
+	if err := c.tp.HandleUnauthorized(ctx, www); err != nil {
+		c.emitErr(ctx, out, fmt.Errorf("handle unauthorized: %w", err))
+		return false
+	}
+	return true
+}
+
+// emit404 — общая обработка 404. ErrSessionLost если у нас есть session id,
+// иначе обычный http-error. Закрывает resp.Body (симметрично handle401).
+func (c *Client) emit404(ctx context.Context, resp *http.Response, out chan<- proxy.MessageOrError) {
+	drainAndClose(resp.Body)
+	if c.session.getSessionID() != "" {
+		c.emitErr(ctx, out, proxy.ErrSessionLost)
+		return
+	}
+	c.emitErr(ctx, out, fmt.Errorf("http 404"))
 }
 
 // emit неблокирующе отправляет moe в out, либо завершается на ctx cancel.

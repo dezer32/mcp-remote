@@ -97,6 +97,12 @@ type Proxy struct {
 // "обычного" request. Защита от бесконечной петли при постоянно сбрасываемой сессии.
 const maxRecoveryAttempts = 3
 
+// MCP-specific JSON-RPC method names, перехватываемые proxy для recovery-replay.
+const (
+	methodInitialize       = "initialize"
+	methodNotifInitialized = "notifications/initialized"
+)
+
 // New собирает proxy. Логика — в Run.
 func New(t Transport, r Remote, log *slog.Logger) *Proxy {
 	if log == nil {
@@ -251,7 +257,7 @@ func (p *Proxy) runStdinReader(ctx context.Context, wg *sync.WaitGroup) error {
 // все ответы. Перехватывает initialize и ErrSessionLost.
 func (p *Proxy) handleClientRequest(ctx context.Context, wg *sync.WaitGroup, req jsonrpc.Message) {
 	idKey := string(req.ID)
-	isInitialize := req.Method == "initialize"
+	isInitialize := req.Method == methodInitialize
 
 	if isInitialize {
 		// Делаем глубокую копию (json.RawMessage — share underlying bytes, но
@@ -366,7 +372,7 @@ func (p *Proxy) captureProtocolVersion(result json.RawMessage) {
 // handleClientNotification — fire-and-forget remote.Send. Перехватывает
 // notifications/initialized для последующего replay.
 func (p *Proxy) handleClientNotification(ctx context.Context, wg *sync.WaitGroup, notif jsonrpc.Message) {
-	if notif.Method == "notifications/initialized" {
+	if notif.Method == methodNotifInitialized {
 		cp := notif
 		p.mu.Lock()
 		p.initializedNotif = &cp
@@ -601,7 +607,7 @@ func (p *Proxy) doRecovery(ctx context.Context, wg *sync.WaitGroup) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			p.dispatchRequest(ctx, req, req.Method == "initialize")
+			p.dispatchRequest(ctx, req, req.Method == methodInitialize)
 		}()
 	}
 
