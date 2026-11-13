@@ -44,9 +44,9 @@ Compile-time проверки склейки сидят в `main.go` (`var _ pro
 |-------|------|
 | `internal/jsonrpc` | JSON-RPC 2.0 типы; `Decode`/`Encode`/`BatchDecode`; `Message.IsRequest/IsNotification/IsResponse`. |
 | `internal/stdio`   | Реализация `proxy.Transport`. Newline-delimited JSON. Фоновая read-горутина стартует через `sync.Once`; **она НЕ отменяется ctx**, висит до EOF на `in` (намеренно — Claude Desktop закрывает stdin на shutdown). Write атомарен под мьютексом, батч пишется одной записью. |
-| `internal/httpmcp` | Реализация `proxy.Remote`. POST для send, GET SSE для listen (с reconnect+backoff+Last-Event-ID), `MCP-Session-Id`/`MCP-Protocol-Version` headers. Один retry на 401 (через `TokenProvider.HandleUnauthorized`). На 404 при наличии sessionID → `proxy.ErrSessionLost`. `CheckRedirect` блокирует cross-origin (защита от token leak). `Close` шлёт DELETE если есть sessionID. |
+| `internal/httpmcp` | Реализация `proxy.Remote`. POST для send, GET SSE для listen (reconnect+backoff+Last-Event-ID; 408/429/5xx на GET — reconnect с backoff, прочие статусы — ошибка и стоп; backoff сбрасывается только после стрима, прожившего `listenStableStream`), `MCP-Session-Id`/`MCP-Protocol-Version` headers. Один retry на 401 (через `TokenProvider.HandleUnauthorized`). Поколение сессии: `ResetSession` → `gen++`; `Mcp-Session-Id` из ответа запроса со старым поколением игнорируется; 404 → `proxy.ErrSessionLost`, если запрос *ушёл* с sessionID (снимок на момент отправки, а не текущее состояние). `CheckRedirect` блокирует cross-origin (защита от token leak). `Close` шлёт DELETE если есть sessionID. |
 | `internal/oauth`   | `Provider` (TokenProvider), `Storage` (файлы `0600`, директории `0700`), `discover` (PRM/AS), callback HTTP-сервер на `cfg.Host:port`, PKCE S256, `DefaultOpener` через `$BROWSER`/open/xdg-open/cmd start. Файлы лежат в `<configDir>/<sha256(ServerURL)[:16]>/{tokens,client,metadata}.json`. |
-| `internal/proxy`   | Маршрутизация + recovery. Stdin reader, listener (GET SSE), recovery dispatcher — три фоновые горутины. |
+| `internal/proxy`   | Маршрутизация + recovery. Две фоновые горутины — stdin reader и recovery dispatcher. Listener (GET SSE) стартует после доставки `notifications/initialized` (GET без сессии серверы отклоняют); его жизненным циклом владеет recovery. |
 | `internal/config`  | Парсинг argv (свой парсер: standard `flag` не даёт смешивать позиционные и флаги в произвольном порядке). Резолв `configDir` по приоритету: `--config-dir` → `$MCP_REMOTE_CONFIG_DIR` → `os.UserConfigDir`/mcp-remote → `$HOME/.mcp-auth`. |
 | `internal/logging` | `slog` → stderr; уровни DEBUG/INFO/ERROR через `--debug`/`--silent`. |
 
@@ -57,11 +57,13 @@ Compile-time проверки склейки сидят в `main.go` (`var _ pro
 1. Складывает request в `pendingReplay`, **не** пишет клиенту.
 2. Тригерит `recoveryTrigger` (coalescing через buffered channel size 1).
 3. `runRecovery` берёт `recoveryMu.Lock()` (stdin-dispatch держит `RLock` → новые in-flight не выпускаются на время recovery).
-4. `remote.ResetSession()` → replay сохранённого `initialize` (proxy запоминает первый initialize в `firstInitialize` и `notifications/initialized` в `initializedNotif`) → replay pending.
-5. На успех — `recoveryAttempts` сбрасывается на следующем удачном response.
-6. На >`maxRecoveryAttempts` (3) подряд session-lost — `failAndShutdown`: всем in-flight и pending пишется JSON-RPC error `-32000`, proxy завершается.
+4. `stopListener()` (cancel + join) → `remote.ResetSession()` → replay сохранённого `initialize` (proxy запоминает первый initialize в `firstInitialize` и `notifications/initialized` в `initializedNotif`) → replay `initialized` (включает listener) → replay pending → после прохода `maybeStartListener` поднимает listener на новой сессии.
+5. На успех — `recoveryAttempts` сбрасывается на следующем удачном response, а также если с прошлого успешного recovery прошло больше `recoveryAttemptsWindow` (1 мин). На успешный `doRecovery` сам по себе НЕ сбрасывается — иначе петля «recovery ок → сразу 404» не упрётся в лимит.
+6. На >`maxRecoveryAttempts` (3) подряд session-lost — `failAndShutdown`: всем in-flight и pending пишется JSON-RPC error `-32000` (до `close(recoveryFail)` — после него ctx отменён и запись не пройдёт), proxy завершается.
 
-Listener (`runListener`) при session-lost тоже триггерит recovery и **ждёт** на `recoveryMu.RLock()` перед reopen — пока recovery не закончит.
+Сигнал recovery: флаги `recoveryPending`/`recoveryRunning` под `p.mu`; `triggerRecoveryLocked` схлопывает повторные сигналы. POST-путь во время идущего прохода ставит следующий (нужен для replay запросов, потерявших сессию после снимка).
+
+Listener: `doRecovery` останавливает его (cancel + join, включая HTTP-продюсер `doListen` — `runListener` дочитывает канал `Listen` до закрытия) **до** `ResetSession` и перезапускает после replay — во время recovery GET-ов нет, старый продюсер не перезапишет сессию. На session-lost listener только сигналит (`requestRecoveryFromListener`, no-op если recovery уже ожидается/идёт) и выходит. Прочие ошибки стрима не терминальны; закрытый канал (405 и т.п.) — listener стоит до следующего успешного recovery.
 
 ### OAuth-флоу — порядок шагов
 

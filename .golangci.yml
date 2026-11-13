@@ -17,10 +17,12 @@ linters:
       disable:
         - fieldalignment
     errcheck:
+      # Исключение по статическому типу получателя: только Close у значений типа
+      # io.ReadCloser (тела HTTP-ответов/запросов — resp.Body, r.Body и т.п.).
+      # io.WriteCloser, *os.File и прочие Close под исключение не попадают.
+      # Что конкретный writer за интерфейсом проверен — правило не гарантирует.
       exclude-functions:
-        - (*net/http.Response).Body.Close
         - (io.ReadCloser).Close
-        - (io.Closer).Close
   exclusions:
     rules:
       - path: _test\.go

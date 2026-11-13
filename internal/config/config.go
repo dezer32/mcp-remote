@@ -216,18 +216,8 @@ func Parse(args []string) (*Config, error) {
 	}
 
 	rawURL := positionals[0]
-	if rawURL == "" {
-		return nil, errors.New("ServerURL required")
-	}
-	u, urlErr := url.Parse(rawURL)
-	if urlErr != nil {
-		return nil, fmt.Errorf("parse ServerURL %q: %w", rawURL, urlErr)
-	}
-	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("parse ServerURL %q: scheme and host required", rawURL)
-	}
-	if u.Scheme != "https" && !allowHTTP {
-		return nil, errors.New("non-https URL requires --allow-http")
+	if err := validateServerURL(rawURL, allowHTTP); err != nil {
+		return nil, err
 	}
 	cfg.ServerURL = rawURL
 
@@ -258,24 +248,48 @@ func Parse(args []string) (*Config, error) {
 		cfg.AuthTimeout = d
 	}
 
-	var err error
-	if cfg.StaticOAuthClientMetadataJSON, err = loadJSONFlag(staticMeta, "--static-oauth-client-metadata"); err != nil {
+	metaJSON, err := loadJSONFlag(staticMeta, "--static-oauth-client-metadata")
+	if err != nil {
 		return nil, err
 	}
-	if cfg.StaticOAuthClientInfoJSON, err = loadJSONFlag(staticInfo, "--static-oauth-client-info"); err != nil {
+	cfg.StaticOAuthClientMetadataJSON = metaJSON
+
+	infoJSON, err := loadJSONFlag(staticInfo, "--static-oauth-client-info")
+	if err != nil {
 		return nil, err
 	}
+	cfg.StaticOAuthClientInfoJSON = infoJSON
 
 	if host != "" {
 		cfg.Host = host
 	}
 
-	cfg.ConfigDir, err = resolveConfigDir(configDir)
+	dir, err := resolveConfigDir(configDir)
 	if err != nil {
 		return nil, err
 	}
+	cfg.ConfigDir = dir
 
 	return cfg, nil
+}
+
+// validateServerURL проверяет позиционный ServerURL: непустой, парсится,
+// содержит схему и хост; не-HTTPS допускается только с --allow-http.
+func validateServerURL(raw string, allowHTTP bool) error {
+	if raw == "" {
+		return errors.New("ServerURL required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parse ServerURL %q: %w", raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("parse ServerURL %q: scheme and host required", raw)
+	}
+	if u.Scheme != "https" && !allowHTTP {
+		return errors.New("non-https URL requires --allow-http")
+	}
+	return nil
 }
 
 // resolveConfigDir выбирает каталог хранения по приоритету

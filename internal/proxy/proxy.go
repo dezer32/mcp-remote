@@ -51,7 +51,9 @@ type Remote interface {
 	// и закрытие канала.
 	Send(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error)
 	// Listen — GET SSE для server-initiated вне client-request. Контракт ошибок
-	// тот же, что у Send.
+	// тот же, что у Send. После отмены ctx канал обязан закрыться, и закрытие —
+	// последнее действие продюсера: proxy дочитывает канал до закрытия, прежде
+	// чем сбросить сессию (join продюсера в stopListener).
 	Listen(ctx context.Context) (<-chan MessageOrError, error)
 	// SetProtocolVersion вызывается proxy один раз после успешного initialize.
 	SetProtocolVersion(version string)
@@ -88,14 +90,39 @@ type Proxy struct {
 	recoveryFail chan struct{}
 	// recoveryFailErr — почему упало recovery (под mu).
 	recoveryFailErr error
-	// recoveryAttempts — счётчик подряд идущих recovery-проходов. Сбрасывается на успех
-	// последующего request-а. Защита от петли: если N подряд приводят к session-lost — fail.
+	// recoveryAttempts — счётчик подряд идущих recovery-проходов (под mu). Сбрасывается
+	// на успех последующего request-а и если с прошлого успешного прохода прошло
+	// больше recoveryWindow. Защита от петли: если N подряд приводят к session-lost — fail.
 	recoveryAttempts int
+
+	// --- Сигнал recovery и жизненный цикл listener-а (всё под mu). ---
+
+	// recoveryPending — сигнал поставлен в recoveryTrigger (или вычитан, но проход
+	// ещё не начался). Инвариант: pending ⇔ сигнал в буфере или вычитывается.
+	recoveryPending bool
+	// recoveryRunning — идёт проход recovery.
+	recoveryRunning bool
+	// lastRecoveryAt — время окончания последнего успешного прохода.
+	lastRecoveryAt time.Time
+	// recoveryWindow — окно счётчика попыток (поле, а не const — для тестов).
+	recoveryWindow time.Duration
+	// listenerEnabled — notifications/initialized доставлен в текущей сессии:
+	// GET SSE имеет смысл открывать только после него.
+	listenerEnabled bool
+	// listenerCancel/listenerDone — текущий экземпляр listener-а (nil — не запущен).
+	// close(listenerDone) ⇒ и listener, и HTTP-продюсер его Listen завершены.
+	listenerCancel context.CancelFunc
+	listenerDone   chan struct{}
 }
 
 // maxRecoveryAttempts — максимум попыток восстановления подряд без успешного
 // "обычного" request. Защита от бесконечной петли при постоянно сбрасываемой сессии.
 const maxRecoveryAttempts = 3
+
+// recoveryAttemptsWindow — если с прошлого успешного recovery прошло больше,
+// счётчик попыток начинается заново: редкие потери сессии (истечение по TTL)
+// не должны копиться до лимита за всё время жизни прокси.
+const recoveryAttemptsWindow = time.Minute
 
 // MCP-specific JSON-RPC method names, перехватываемые proxy для recovery-replay.
 const (
@@ -115,11 +142,17 @@ func New(t Transport, r Remote, log *slog.Logger) *Proxy {
 		inFlight:        make(map[string]jsonrpc.Message),
 		recoveryTrigger: make(chan struct{}, 1),
 		recoveryFail:    make(chan struct{}),
+		recoveryWindow:  recoveryAttemptsWindow,
 	}
 }
 
-// Run — главный цикл. Запускает три фоновые горутины (stdin reader, remote
-// listener, recovery dispatcher) и ждёт завершения по EOF/ctx/recovery-fail.
+// Run — главный цикл. Запускает две фоновые горутины (stdin reader, recovery
+// dispatcher) и ждёт завершения по EOF/ctx/recovery-fail.
+//
+// Listener (GET SSE для server-initiated сообщений) здесь не стартует: GET без
+// Mcp-Session-Id серверы с сессиями отклоняют. Он запускается после доставки
+// notifications/initialized, а дальше им владеет recovery: останавливает до
+// ResetSession и перезапускает на новой сессии (см. maybeStartListener).
 func (p *Proxy) Run(ctx context.Context) error {
 	loopCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -143,13 +176,6 @@ func (p *Proxy) Run(ctx context.Context) error {
 		defer readerErrMu.Unlock()
 		return readerErr
 	}
-
-	// Listener: server-initiated сообщения вне client-request.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		p.runListener(loopCtx, &wg)
-	}()
 
 	// Recovery dispatcher.
 	wg.Add(1)
@@ -408,6 +434,13 @@ func (p *Proxy) handleClientNotification(ctx context.Context, wg *sync.WaitGroup
 				p.log.Error("transport write", slog.String("err", werr.Error()))
 			}
 		}
+		// initialized доставлен — сессия готова, можно открывать GET SSE.
+		if notif.Method == methodNotifInitialized {
+			p.mu.Lock()
+			p.listenerEnabled = true
+			p.mu.Unlock()
+			p.maybeStartListener(ctx, wg)
+		}
 	}()
 }
 
@@ -439,71 +472,146 @@ func (p *Proxy) handleClientResponse(ctx context.Context, wg *sync.WaitGroup, re
 	}()
 }
 
-// runListener — GET SSE стрим для server-initiated сообщений вне request.
-// На ErrSessionLost — тригерит recovery и перезапускается.
-func (p *Proxy) runListener(ctx context.Context, _ *sync.WaitGroup) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
+// maybeStartListener запускает listener, если он нужен и сейчас допустим:
+// initialized доставлен, экземпляр не запущен, recovery не идёт и не ожидается
+// (иначе стартует сам recovery по окончании), ctx жив.
+//
+// wg.Add вызывается из горутин, которые сами учтены в wg (notification-горутина,
+// runRecovery), поэтому гонки с wg.Wait в Run нет.
+func (p *Proxy) maybeStartListener(ctx context.Context, wg *sync.WaitGroup) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.listenerEnabled || p.listenerDone != nil || p.recoveryPending || p.recoveryRunning || ctx.Err() != nil {
+		return
+	}
 
-		lch, err := p.remote.Listen(ctx)
-		if err != nil {
-			// Listen может вернуть 405 (transport не поддерживает GET) — это ok, выходим тихо.
-			p.log.Debug("remote listen returned err, stopping",
-				slog.String("err", err.Error()))
-			return
-		}
+	lctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	p.listenerCancel = cancel
+	p.listenerDone = done
 
-		sessionLost := false
-		for me := range lch {
-			if me.Err != nil {
-				if errors.Is(me.Err, ErrSessionLost) {
-					p.log.Warn("session lost on Listen stream")
-					p.triggerRecovery()
-					sessionLost = true
-					break
-				}
-				p.log.Error("listen stream error",
-					slog.String("err", me.Err.Error()))
-				// Нефатальная ошибка — выходим из текущего стрима, попробуем поднять заново.
-				break
+	wg.Add(1)
+	go func() {
+		// Порядок выполнения defer-ов: cancel → close(done) → wg.Done.
+		defer wg.Done()
+		defer close(done)
+		defer cancel()
+
+		p.runListener(lctx)
+
+		// Освобождаем слот, если его ещё не забрал stopListener.
+		p.mu.Lock()
+		if p.listenerDone == done {
+			p.listenerCancel = nil
+			p.listenerDone = nil
+		}
+		p.mu.Unlock()
+	}()
+}
+
+// stopListener останавливает текущий listener и дожидается его завершения
+// вместе с HTTP-продюсером Listen (runListener дочитывает канал до закрытия).
+// После возврата ни один GET текущего экземпляра не идёт и сессию не тронет.
+// Listener не берёт recoveryMu и держит mu только кратко — вызывать можно под
+// recoveryMu.Lock, но НЕ под mu.
+func (p *Proxy) stopListener() {
+	p.mu.Lock()
+	cancel, done := p.listenerCancel, p.listenerDone
+	p.listenerCancel, p.listenerDone = nil, nil
+	p.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
+}
+
+// runListener — один проход GET SSE для server-initiated сообщений вне request.
+//
+// Возвращается только после закрытия канала Listen (join продюсера): на выходе
+// отменяет свой ctx и дочитывает канал.
+//
+// На ErrSessionLost только просит recovery и выходит — перезапуск делает
+// recovery после replay. Прочие ошибки не терминальны (например, битое
+// SSE-событие): логируем и читаем дальше; после терминальных продюсер сам
+// закрывает канал. Закрытый канал (405, постоянная ошибка) — listener стоит до
+// следующего успешного recovery.
+func (p *Proxy) runListener(ctx context.Context) {
+	lctx, cancel := context.WithCancel(ctx)
+	lch, err := p.remote.Listen(lctx)
+	if err != nil {
+		cancel()
+		p.log.Debug("remote listen returned err, stopping",
+			slog.String("err", err.Error()))
+		return
+	}
+	defer func() {
+		cancel()
+		// Дренаж до закрытия — join продюсера.
+		for range lch {
+		}
+	}()
+
+	for me := range lch {
+		if me.Err != nil {
+			if ctx.Err() != nil {
+				// Нас остановили — ошибки после отмены не интересны.
+				return
 			}
-			if werr := p.transport.Write(ctx, me.Msg); werr != nil {
-				p.log.Error("transport write from listener",
-					slog.String("err", werr.Error()))
+			if errors.Is(me.Err, ErrSessionLost) {
+				p.log.Warn("session lost on Listen stream")
+				p.requestRecoveryFromListener()
+				return
 			}
+			p.log.Error("listen stream error",
+				slog.String("err", me.Err.Error()))
+			continue
 		}
-
-		if !sessionLost {
-			// Stream нормально закрылся — выходим.
-			return
+		if werr := p.transport.Write(ctx, me.Msg); werr != nil {
+			p.log.Error("transport write from listener",
+				slog.String("err", werr.Error()))
 		}
-
-		// При session-lost ждём пока recovery завершится прежде чем reopen.
-		// Берём RLock — он не выдадут пока recovery держит Lock.
-		p.recoveryMu.RLock()
-		//nolint:staticcheck // намеренный barrier: RLock/RUnlock — это ожидание окончания recovery, не критическая секция.
-		p.recoveryMu.RUnlock()
-		// recovery-fail могла произойти — проверим.
-		select {
-		case <-p.recoveryFail:
-			return
-		case <-ctx.Done():
-			return
-		default:
-		}
-		// Пробуем заново.
+	}
+	if ctx.Err() == nil {
+		p.log.Debug("listen stream closed, listener stopped until next recovery")
 	}
 }
 
-// triggerRecovery — неблокирующий сигнал. Множественные одновременные вызовы
-// схлопываются в один проход recovery.
-func (p *Proxy) triggerRecovery() {
+// triggerRecoveryLocked ставит сигнал recovery. Вызывать под mu.
+// Повторные вызовы до начала прохода схлопываются (recoveryPending). Благодаря
+// инварианту «pending ⇔ сигнал в буфере или вычитывается» буфер при
+// pending == false пуст, и неблокирующая отправка не теряется.
+func (p *Proxy) triggerRecoveryLocked() {
+	if p.recoveryPending {
+		return
+	}
+	p.recoveryPending = true
 	select {
 	case p.recoveryTrigger <- struct{}{}:
 	default:
 	}
+}
+
+// triggerRecovery — неблокирующий сигнал из POST-пути. Сигнал во время идущего
+// прохода ставит следующий: он нужен для replay запросов, попавших в
+// pendingReplay после снимка.
+func (p *Proxy) triggerRecovery() {
+	p.mu.Lock()
+	p.triggerRecoveryLocked()
+	p.mu.Unlock()
+}
+
+// requestRecoveryFromListener — запрос recovery от listener-а на session-lost.
+// Если recovery уже ожидается или идёт, ничего не делает: тот проход сам
+// перезапустит listener. Проверка и постановка — под одним захватом mu.
+func (p *Proxy) requestRecoveryFromListener() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.recoveryPending || p.recoveryRunning {
+		return
+	}
+	p.triggerRecoveryLocked()
 }
 
 // runRecovery читает сигналы и выполняет восстановление сессии.
@@ -513,29 +621,50 @@ func (p *Proxy) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-p.recoveryTrigger:
-			p.mu.Lock()
-			p.recoveryAttempts++
-			attempts := p.recoveryAttempts
-			p.mu.Unlock()
-
-			if attempts > maxRecoveryAttempts {
-				err := fmt.Errorf("recovery: exceeded %d attempts", maxRecoveryAttempts)
-				p.log.Error("recovery aborted", slog.String("err", err.Error()))
-				p.failAndShutdown(ctx, err)
-				return
-			}
-
-			if err := p.doRecovery(ctx, wg); err != nil {
-				p.log.Error("recovery failed", slog.String("err", err.Error()))
-				p.failAndShutdown(ctx, err)
-				return
-			}
-			p.log.Info("session recovered", slog.Int("attempt", attempts))
 		}
+
+		// Между чтением канала и этим захватом pending ещё true — новые
+		// сигналы схлопываются в текущий, зазора нет.
+		p.mu.Lock()
+		p.recoveryPending = false
+		p.recoveryRunning = true
+		if time.Since(p.lastRecoveryAt) > p.recoveryWindow {
+			p.recoveryAttempts = 0
+		}
+		p.recoveryAttempts++
+		attempts := p.recoveryAttempts
+		p.mu.Unlock()
+
+		// На fail recoveryRunning остаётся true — listener больше не стартует.
+		if attempts > maxRecoveryAttempts {
+			err := fmt.Errorf("recovery: exceeded %d attempts", maxRecoveryAttempts)
+			p.log.Error("recovery aborted", slog.String("err", err.Error()))
+			p.failAndShutdown(ctx, err)
+			return
+		}
+
+		if err := p.doRecovery(ctx, wg); err != nil {
+			p.log.Error("recovery failed", slog.String("err", err.Error()))
+			p.failAndShutdown(ctx, err)
+			return
+		}
+
+		p.mu.Lock()
+		p.recoveryRunning = false
+		p.lastRecoveryAt = time.Now()
+		p.mu.Unlock()
+		p.log.Info("session recovered", slog.Int("attempt", attempts))
+
+		// Новый listener на новой сессии. Если уже стоит следующий проход,
+		// старт отложится до его конца.
+		p.maybeStartListener(ctx, wg)
 	}
 }
 
-// failAndShutdown — атомарно записывает причину и закрывает recoveryFail.
+// failAndShutdown записывает причину, отдаёт клиенту ошибки по всем in-flight и
+// pending и только потом закрывает recoveryFail. Порядок важен: по
+// close(recoveryFail) Run отменяет ctx, а Transport.Write с отменённым ctx не
+// пишет — ошибки, отправленные после сигнала, клиент мог не получить.
 func (p *Proxy) failAndShutdown(ctx context.Context, err error) {
 	p.mu.Lock()
 	inFlightSnap := make(map[string]jsonrpc.Message, len(p.inFlight))
@@ -544,17 +673,23 @@ func (p *Proxy) failAndShutdown(ctx context.Context, err error) {
 	}
 	pending := p.pendingReplay
 	p.pendingReplay = nil
-	if p.recoveryFailErr == nil {
+	first := p.recoveryFailErr == nil
+	if first {
 		p.recoveryFailErr = err
-		close(p.recoveryFail)
 	}
 	p.mu.Unlock()
 
 	p.failAllPending(ctx, inFlightSnap, pending, err)
+
+	if first {
+		close(p.recoveryFail)
+	}
 }
 
-// doRecovery делает один проход восстановления: reset → initialize → initialized → replay.
+// doRecovery делает один проход восстановления:
+// stop listener → reset → initialize → initialized → replay pending.
 // Под Lock recoveryMu, чтобы stdin-dispatch не выпускал новых in-flight в это время.
+// Listener перезапускает runRecovery после успешного прохода.
 func (p *Proxy) doRecovery(ctx context.Context, wg *sync.WaitGroup) error {
 	p.recoveryMu.Lock()
 	defer p.recoveryMu.Unlock()
@@ -570,6 +705,11 @@ func (p *Proxy) doRecovery(ctx context.Context, wg *sync.WaitGroup) error {
 		inFlightSnap[k] = v
 	}
 	p.mu.Unlock()
+
+	// Step 0: остановить listener (cancel + join вместе с HTTP-продюсером) до
+	// ResetSession — во время recovery GET-ов нет, включая внутренние
+	// reconnect-ы, и старый продюсер не перезапишет сессию.
+	p.stopListener()
 
 	if savedInit == nil {
 		return errors.New("recovery: no captured initialize request")
@@ -594,6 +734,11 @@ func (p *Proxy) doRecovery(ctx context.Context, wg *sync.WaitGroup) error {
 			return fmt.Errorf("replay initialized notif: %w", err)
 		}
 		p.log.Debug("recovery: initialized notif replayed")
+		// Сессия готова для GET SSE — в т.ч. если 404 пришёл на исходный
+		// initialized и он сам listener не включил. Старт — в runRecovery.
+		p.mu.Lock()
+		p.listenerEnabled = true
+		p.mu.Unlock()
 	}
 
 	// Step 4: replay все pending requests в отдельных горутинах.
@@ -616,7 +761,12 @@ func (p *Proxy) doRecovery(ctx context.Context, wg *sync.WaitGroup) error {
 }
 
 // replayInitialize отправляет initialize и забирает response (с protocolVersion).
+// Работает с дочерним ctx, отменяемым на выходе: иначе SSE-продюсер replay-запроса,
+// который мы перестали читать после response, висел бы на emit до конца процесса.
 func (p *Proxy) replayInitialize(ctx context.Context, init jsonrpc.Message) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	respCh, err := p.remote.Send(ctx, init)
 	if err != nil {
 		return err
@@ -647,8 +797,12 @@ func (p *Proxy) replayInitialize(ctx context.Context, init jsonrpc.Message) erro
 	}
 }
 
-// replayInitializedNotif отправляет initialized notification.
+// replayInitializedNotif отправляет initialized notification. Дочерний ctx —
+// по той же причине, что в replayInitialize (ранний выход по ошибке).
 func (p *Proxy) replayInitializedNotif(ctx context.Context, notif jsonrpc.Message) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	ch, err := p.remote.Send(ctx, notif)
 	if err != nil {
 		return err

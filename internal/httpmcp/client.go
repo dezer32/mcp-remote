@@ -50,6 +50,9 @@ const (
 	listenBackoffMin    = 1 * time.Second
 	listenBackoffMax    = 30 * time.Second
 	closeRequestTimeout = 2 * time.Second
+	// listenStableStream — сколько должен прожить GET SSE стрим, чтобы
+	// считаться стабильным и сбросить backoff перед reconnect-ом.
+	listenStableStream = 30 * time.Second
 )
 
 // Client — Streamable HTTP клиент. Реализует proxy.Remote.
@@ -62,6 +65,12 @@ type Client struct {
 	httpC    *http.Client
 
 	session sessionState
+
+	// Параметры reconnect-а GET SSE (из const в New; поля — чтобы тесты
+	// могли их уменьшить).
+	backoffMin   time.Duration
+	backoffMax   time.Duration
+	stableStream time.Duration
 }
 
 // New создаёт клиент. Возвращает ошибку если cfg не валиден на этом уровне
@@ -73,7 +82,14 @@ func New(cfg *config.Config, tp TokenProvider, log *slog.Logger) (*Client, error
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Client{cfg: cfg, tp: tp, log: log}, nil
+	return &Client{
+		cfg:          cfg,
+		tp:           tp,
+		log:          log,
+		backoffMin:   listenBackoffMin,
+		backoffMax:   listenBackoffMax,
+		stableStream: listenStableStream,
+	}, nil
 }
 
 // httpClient lazy-init под sync.Once. Один shared экземпляр на Client.
@@ -93,7 +109,11 @@ func (c *Client) httpClient() *http.Client {
 // MCP-Protocol-Version и Authorization из tp.Token если user не задал свой.
 // Заголовки из cfg.Headers ставятся ДО системных — поэтому пользовательский
 // Authorization перебьёт OAuth, а Accept останется системным.
-func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withContentType bool) error {
+//
+// Возвращает снимок сессии, с которым уходит запрос: по нему ответ решает,
+// применять ли пришедший Mcp-Session-Id (extractSessionID) и считать ли 404
+// потерей сессии (emit404).
+func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withContentType bool) (sessionSnap, error) {
 	for _, h := range c.cfg.Headers {
 		req.Header.Set(h.Name, h.Value)
 	}
@@ -103,8 +123,9 @@ func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withC
 		req.Header.Set("Content-Type", contentTypeJSON)
 	}
 
-	if sid := c.session.getSessionID(); sid != "" {
-		req.Header.Set(headerSessionID, sid)
+	snap := c.session.snapshot()
+	if snap.id != "" {
+		req.Header.Set(headerSessionID, snap.id)
 	}
 	if pv := c.session.getProtocolVersion(); pv != "" {
 		req.Header.Set(headerProtocolVersion, pv)
@@ -113,17 +134,19 @@ func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withC
 	if req.Header.Get("Authorization") == "" && c.tp != nil {
 		t, err := c.tp.Token(ctx)
 		if err != nil {
-			return fmt.Errorf("token provider: %w", err)
+			return snap, fmt.Errorf("token provider: %w", err)
 		}
 		if t != "" {
 			req.Header.Set("Authorization", "Bearer "+t)
 		}
 	}
-	return nil
+	return snap, nil
 }
 
-// extractSessionID читает Mcp-Session-Id из ответа и сохраняет, если валиден.
-func (c *Client) extractSessionID(resp *http.Response) {
+// extractSessionID читает Mcp-Session-Id из ответа и сохраняет, если валиден и
+// запрос ушёл в текущем поколении сессии. Ответ запроса, отправленного до
+// ResetSession, сессию не меняет.
+func (c *Client) extractSessionID(resp *http.Response, snap sessionSnap) {
 	id := resp.Header.Get(headerSessionID)
 	if id == "" {
 		return
@@ -132,7 +155,10 @@ func (c *Client) extractSessionID(resp *http.Response) {
 		c.log.Warn("ignored non-ASCII-printable Mcp-Session-Id", slog.String("value", id))
 		return
 	}
-	c.session.setSessionID(id)
+	if !c.session.setSessionIDIfCurrent(id, snap.gen) {
+		c.log.Debug("ignored Mcp-Session-Id from response to request of previous session",
+			slog.String("value", id))
+	}
 }
 
 // Send — POST одного JSON-RPC сообщения. См. интерфейс proxy.Remote.
@@ -163,7 +189,8 @@ func (c *Client) sendOnce(ctx context.Context, body []byte, out chan<- proxy.Mes
 		c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
 		return
 	}
-	if err = c.setRequestHeaders(ctx, req, true); err != nil {
+	snap, err := c.setRequestHeaders(ctx, req, true)
+	if err != nil {
 		c.emitErr(ctx, out, err)
 		return
 	}
@@ -176,12 +203,12 @@ func (c *Client) sendOnce(ctx context.Context, body []byte, out chan<- proxy.Mes
 
 	switch resp.StatusCode {
 	case http.StatusAccepted:
-		c.extractSessionID(resp)
+		c.extractSessionID(resp, snap)
 		drainAndClose(resp.Body)
 		return
 
 	case http.StatusOK:
-		c.extractSessionID(resp)
+		c.extractSessionID(resp, snap)
 		c.handleOK(ctx, resp, out)
 		return
 
@@ -193,7 +220,7 @@ func (c *Client) sendOnce(ctx context.Context, body []byte, out chan<- proxy.Mes
 		return
 
 	case http.StatusNotFound:
-		c.emit404(ctx, resp, out)
+		c.emit404(ctx, resp, out, snap)
 		return
 
 	default:
@@ -252,6 +279,16 @@ func (c *Client) Listen(ctx context.Context) (<-chan proxy.MessageOrError, error
 }
 
 // doListen — цикл reconnect для GET SSE.
+//
+// close(out) — последнее действие горутины (после всех extractSessionID и
+// setLastID), а все ожидания внутри прерываются по ctx. Поэтому consumer,
+// отменивший ctx и дочитавший канал до закрытия, знает: продюсер завершён и
+// сессию больше не тронет.
+//
+// Backoff между reconnect-ами: первый reconnect — сразу, далее backoffMin,
+// 2·backoffMin… до backoffMax (с jitter ±25%, т.е. фактическая пауза до
+// 1.25·backoffMax). Сбрасывается только после стрима, прожившего stableStream:
+// сервер, сразу закрывающий GET, не загонит клиент в цикл без пауз.
 func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) {
 	defer close(out)
 
@@ -274,7 +311,8 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
 			return
 		}
-		if err = c.setRequestHeaders(ctx, req, false); err != nil {
+		snap, err := c.setRequestHeaders(ctx, req, false)
+		if err != nil {
 			c.emitErr(ctx, out, err)
 			return
 		}
@@ -308,11 +346,11 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			continue
 
 		case http.StatusNotFound:
-			c.emit404(ctx, resp, out)
+			c.emit404(ctx, resp, out, snap)
 			return
 
 		case http.StatusOK:
-			c.extractSessionID(resp)
+			c.extractSessionID(resp, snap)
 			retried401 = false
 			ct := resp.Header.Get("Content-Type")
 			mediaType, _, mtErr := mime.ParseMediaType(ct)
@@ -321,6 +359,7 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 				c.emitErr(ctx, out, fmt.Errorf("listen: unexpected content-type %q", ct))
 				return
 			}
+			connectedAt := time.Now()
 			err := parseSSE(ctx, resp.Body, out, setLastID)
 			resp.Body.Close()
 			if ctx.Err() != nil {
@@ -329,14 +368,27 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			if err != nil && !errors.Is(err, io.EOF) {
 				c.log.Debug("listen: sse error, will reconnect", slog.String("err", err.Error()))
 			}
-			// Сбрасываем backoff — connect был успешен.
-			backoff = 0
+			// Сбрасываем backoff только после стабильного стрима: сразу
+			// закрывающийся стрим продолжает наращивать паузу.
+			if time.Since(connectedAt) >= c.stableStream {
+				backoff = 0
+			}
 			if !c.sleepBackoff(ctx, &backoff) {
 				return
 			}
 			continue
 
 		default:
+			if isRetryableListenStatus(resp.StatusCode) {
+				// Тело закрываем до паузы — не держим соединение во время backoff.
+				drainAndClose(resp.Body)
+				c.log.Debug("listen: retryable status, will reconnect",
+					slog.Int("status", resp.StatusCode))
+				if !c.sleepBackoff(ctx, &backoff) {
+					return
+				}
+				continue
+			}
 			excerpt := readBodyExcerpt(resp.Body)
 			resp.Body.Close()
 			c.emitErr(ctx, out, fmt.Errorf("listen: http %d: %s", resp.StatusCode, excerpt))
@@ -345,12 +397,25 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 	}
 }
 
-// sleepBackoff ждёт текущий backoff и увеличивает его (capped listenBackoffMax,
-// с jitter). Если backoff == 0 — ничего не ждёт и сразу выставляет минимум.
+// isRetryableListenStatus — статусы GET SSE, после которых имеет смысл
+// переподключиться с backoff (временная недоступность), а не останавливать
+// listener: 408, 429 и 5xx.
+func isRetryableListenStatus(code int) bool {
+	switch {
+	case code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
+		return true
+	case code >= 500 && code <= 599:
+		return true
+	}
+	return false
+}
+
+// sleepBackoff ждёт текущий backoff и увеличивает его (capped c.backoffMax,
+// с jitter ±25%). Если backoff == 0 — ничего не ждёт и сразу выставляет минимум.
 // Возвращает false если ctx отменён.
 func (c *Client) sleepBackoff(ctx context.Context, backoff *time.Duration) bool {
 	if *backoff == 0 {
-		*backoff = listenBackoffMin
+		*backoff = c.backoffMin
 		return ctx.Err() == nil
 	}
 	// jitter ±25%
@@ -362,8 +427,8 @@ func (c *Client) sleepBackoff(ctx context.Context, backoff *time.Duration) bool 
 	case <-time.After(wait):
 	}
 	*backoff *= 2
-	if *backoff > listenBackoffMax {
-		*backoff = listenBackoffMax
+	if *backoff > c.backoffMax {
+		*backoff = c.backoffMax
 	}
 	return true
 }
@@ -392,7 +457,8 @@ func (c *Client) Close(ctx context.Context) error {
 		c.log.Warn("close: new request", slog.String("err", err.Error()))
 		return nil
 	}
-	if err = c.setRequestHeaders(delCtx, req, false); err != nil {
+	// Снимок сессии DELETE-у не нужен: ответ сессию не меняет.
+	if _, err = c.setRequestHeaders(delCtx, req, false); err != nil {
 		c.log.Warn("close: set headers", slog.String("err", err.Error()))
 		return nil
 	}
@@ -434,11 +500,13 @@ func (c *Client) handle401(ctx context.Context, resp *http.Response, retried boo
 	return true
 }
 
-// emit404 — общая обработка 404. ErrSessionLost если у нас есть session id,
-// иначе обычный http-error. Закрывает resp.Body (симметрично handle401).
-func (c *Client) emit404(ctx context.Context, resp *http.Response, out chan<- proxy.MessageOrError) {
+// emit404 — общая обработка 404. ErrSessionLost, если запрос ушёл с session id
+// (snap — снимок на момент отправки, а не текущее состояние: за время запроса
+// сессию мог сбросить recovery или установить другой запрос), иначе обычный
+// http-error. Закрывает resp.Body (симметрично handle401).
+func (c *Client) emit404(ctx context.Context, resp *http.Response, out chan<- proxy.MessageOrError, snap sessionSnap) {
 	drainAndClose(resp.Body)
-	if c.session.getSessionID() != "" {
+	if snap.id != "" {
 		c.emitErr(ctx, out, proxy.ErrSessionLost)
 		return
 	}

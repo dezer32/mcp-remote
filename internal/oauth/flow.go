@@ -178,8 +178,8 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 	p.cachedMeta = meta
 	p.cachedResource = resource
 	if p.storage != nil {
-		if err = p.storage.SaveMetadata(meta, resource); err != nil {
-			p.log.Warn("oauth: save metadata", slog.String("error", err.Error()))
+		if saveErr := p.storage.SaveMetadata(meta, resource); saveErr != nil {
+			p.log.Warn("oauth: save metadata", slog.String("error", saveErr.Error()))
 		}
 	}
 
@@ -215,8 +215,8 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 		}
 		p.cachedClient = client
 		if p.storage != nil {
-			if err = p.storage.SaveClient(client); err != nil {
-				p.log.Warn("oauth: save client", slog.String("error", err.Error()))
+			if saveErr := p.storage.SaveClient(client); saveErr != nil {
+				p.log.Warn("oauth: save client", slog.String("error", saveErr.Error()))
 			}
 		}
 	}
@@ -228,10 +228,10 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 	authURL := buildAuthorizeURL(meta, p.cachedClient, callbackURL, challenge, state, resource)
 	p.log.Info("oauth: opening browser for authorization", slog.String("url", authURL))
 
-	if err = p.opener.Open(ctx, authURL); err != nil {
+	if openErr := p.opener.Open(ctx, authURL); openErr != nil {
 		// Не фатально: пользователь может открыть URL вручную. Логируем и
 		// печатаем URL в stderr.
-		p.log.Warn("oauth: opener failed", slog.String("error", err.Error()))
+		p.log.Warn("oauth: opener failed", slog.String("error", openErr.Error()))
 		fmt.Fprintf(os.Stderr, "Open this URL to authorize: %s\n", authURL)
 	}
 
@@ -253,8 +253,8 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 
 	p.cachedTokens = tok
 	if p.storage != nil {
-		if err := p.storage.SaveTokens(tok); err != nil {
-			p.log.Warn("oauth: save tokens", slog.String("error", err.Error()))
+		if saveErr := p.storage.SaveTokens(tok); saveErr != nil {
+			p.log.Warn("oauth: save tokens", slog.String("error", saveErr.Error()))
 		}
 	}
 	return nil

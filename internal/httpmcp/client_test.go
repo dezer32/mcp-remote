@@ -713,10 +713,20 @@ func TestClose_NoSessionNoCall(t *testing.T) {
 // --- bonus: ResetSession clears stored id ---
 func TestResetSession(t *testing.T) {
 	c := newClient(t, "http://example.invalid/", nil)
-	c.session.setSessionID("abc")
+	c.session.setSessionIDIfCurrent("abc", 0)
 	c.ResetSession()
 	if got := c.session.getSessionID(); got != "" {
 		t.Errorf("sessionID=%q want empty", got)
+	}
+	// Устаревшее поколение id не применяется; текущее — применяется.
+	if c.session.setSessionIDIfCurrent("stale", 0) {
+		t.Errorf("stale generation accepted")
+	}
+	if !c.session.setSessionIDIfCurrent("fresh", 1) {
+		t.Errorf("current generation rejected")
+	}
+	if got := c.session.getSessionID(); got != "fresh" {
+		t.Errorf("sessionID=%q want fresh", got)
 	}
 }
 
@@ -874,5 +884,423 @@ func TestSend_OK_SSE_BadJSONContinues(t *testing.T) {
 	}
 	if got[1].Err != nil {
 		t.Errorf("second should be msg, got err=%v", got[1].Err)
+	}
+}
+
+// ---------- Listen: backoff и ретраи статусов ----------
+
+// setBackoff уменьшает параметры reconnect-а для быстрых тестов.
+func setBackoff(c *Client, minB, maxB, stable time.Duration) {
+	c.backoffMin, c.backoffMax, c.stableStream = minB, maxB, stable
+}
+
+// sseHeaders отдаёт заголовки SSE-ответа и сразу их флашит.
+func sseHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Сразу закрывающийся стрим: reconnect продолжается, но паузы растут до max.
+func TestListen_ImmediateCloseBacksOff(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		connects []time.Time
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		connects = append(connects, time.Now())
+		mu.Unlock()
+		sseHeaders(w) // и сразу конец стрима
+	}))
+	defer srv.Close()
+
+	const minB, maxB = 20 * time.Millisecond, 160 * time.Millisecond
+	c := newClient(t, srv.URL, nil)
+	setBackoff(c, minB, maxB, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, _ := c.Listen(ctx)
+	time.Sleep(time.Second)
+	cancel()
+	if got := collect(t, ch, 2*time.Second); len(got) != 0 {
+		t.Fatalf("unexpected items: %+v", got)
+	}
+
+	mu.Lock()
+	ts := append([]time.Time(nil), connects...)
+	mu.Unlock()
+	if len(ts) < 4 || len(ts) > 25 {
+		t.Fatalf("connects=%d, want 4..25 (reconnect without tight loop)", len(ts))
+	}
+	// jitter ±25% → пауза на максимуме не меньше 0.75·max.
+	if last := ts[len(ts)-1].Sub(ts[len(ts)-2]); last < maxB*3/4 {
+		t.Fatalf("last interval=%v, want >= %v (backoff must grow)", last, maxB*3/4)
+	}
+}
+
+// Стрим, проживший stableStream, сбрасывает накопленный backoff.
+func TestListen_StableStreamResetsBackoff(t *testing.T) {
+	var n atomic.Int32
+	stableEnded := make(chan time.Time, 1)
+	nextConnect := make(chan time.Time, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		k := n.Add(1)
+		sseHeaders(w)
+		switch k {
+		case 1, 2:
+			// Мгновенно закрывающиеся стримы — копят backoff (до 2·min).
+		case 3:
+			// «Стабильный» стрим: живёт дольше stableStream.
+			time.Sleep(100 * time.Millisecond)
+			stableEnded <- time.Now()
+		case 4:
+			nextConnect <- time.Now()
+			<-r.Context().Done()
+		default:
+			<-r.Context().Done()
+		}
+	}))
+	defer srv.Close()
+
+	c := newClient(t, srv.URL, nil)
+	setBackoff(c, 300*time.Millisecond, 10*time.Second, 50*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, _ := c.Listen(ctx)
+
+	var ended, connected time.Time
+	select {
+	case ended = <-stableEnded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stable stream never ended")
+	}
+	select {
+	case connected = <-nextConnect:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no reconnect after stable stream")
+	}
+	cancel()
+	collect(t, ch, 2*time.Second)
+
+	// Без сброса пауза была бы ≥ 0.75·600ms = 450ms.
+	if d := connected.Sub(ended); d >= 150*time.Millisecond {
+		t.Fatalf("reconnect after stable stream took %v, want < 150ms (backoff reset)", d)
+	}
+}
+
+// Отмена ctx во время паузы backoff быстро закрывает канал.
+func TestListen_CancelDuringBackoff(t *testing.T) {
+	var n atomic.Int32
+	second := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) == 2 {
+			close(second)
+		}
+		sseHeaders(w)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, srv.URL, nil)
+	setBackoff(c, 10*time.Second, 10*time.Second, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, _ := c.Listen(ctx)
+
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second connect not observed")
+	}
+	// Даём клиенту дочитать пустой стрим и уйти в паузу (≥ 7.5 с).
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	cancel()
+	collect(t, ch, 2*time.Second)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("channel closed %v after cancel, want < 500ms", d)
+	}
+	if got := n.Load(); got != 2 {
+		t.Fatalf("connects=%d, want 2", got)
+	}
+}
+
+// 408/429/5xx на GET → reconnect с backoff, а не остановка listener-а.
+func TestListen_RetryableStatusRetried(t *testing.T) {
+	for _, code := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			var n atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if n.Add(1) == 1 {
+					w.WriteHeader(code)
+					_, _ = w.Write([]byte("try later"))
+					return
+				}
+				sseHeaders(w)
+				fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}\n\n")
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				<-r.Context().Done()
+			}))
+			defer srv.Close()
+
+			c := newClient(t, srv.URL, nil)
+			setBackoff(c, 10*time.Millisecond, 50*time.Millisecond, time.Hour)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ch, _ := c.Listen(ctx)
+
+			select {
+			case moe, ok := <-ch:
+				if !ok {
+					t.Fatal("channel closed, want reconnect")
+				}
+				if moe.Err != nil {
+					t.Fatalf("unexpected err: %v", moe.Err)
+				}
+				if moe.Msg.Method != "notifications/ping" {
+					t.Fatalf("unexpected msg: %+v", moe.Msg)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("no message after retryable status")
+			}
+			cancel()
+			for _, moe := range collect(t, ch, 2*time.Second) {
+				if moe.Err != nil {
+					t.Fatalf("unexpected err: %v", moe.Err)
+				}
+			}
+			if got := n.Load(); got != 2 {
+				t.Fatalf("connects=%d, want 2", got)
+			}
+		})
+	}
+}
+
+// Постоянная ошибка (400) → одна ошибка и закрытие канала, без reconnect-а.
+func TestListen_PermanentStatusStops(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("bad"))
+	}))
+	defer srv.Close()
+
+	c := newClient(t, srv.URL, nil)
+	setBackoff(c, 10*time.Millisecond, 50*time.Millisecond, time.Hour)
+	ch, _ := c.Listen(context.Background())
+	got := collect(t, ch, 2*time.Second)
+	if len(got) != 1 || got[0].Err == nil {
+		t.Fatalf("expected single err, got %+v", got)
+	}
+	if !strings.Contains(got[0].Err.Error(), "http 400") {
+		t.Fatalf("err=%v, want http 400", got[0].Err)
+	}
+	if c := n.Load(); c != 1 {
+		t.Fatalf("connects=%d, want 1", c)
+	}
+}
+
+// ---------- поколение сессии ----------
+
+// rpcMethod достаёт method из тела JSON-RPC запроса.
+func rpcMethod(t *testing.T, r *http.Request) (string, json.RawMessage) {
+	t.Helper()
+	var m struct {
+		Method string          `json:"method"`
+		ID     json.RawMessage `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+		t.Errorf("decode body: %v", err)
+	}
+	return m.Method, m.ID
+}
+
+// writeJSONResult отвечает 200 application/json c пустым result.
+func writeJSONResult(w http.ResponseWriter, id json.RawMessage) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	b, _ := jsonrpc.Encode(jsonrpc.Message{JSONRPC: jsonrpc.Version, ID: id, Result: json.RawMessage(`{}`)})
+	w.Write(b)
+}
+
+// Ответ запроса, ушедшего с S1 до ResetSession, не перезаписывает S2.
+func TestSend_StaleSessionHeaderIgnoredAfterReset(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusAccepted} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var initN atomic.Int32
+			slowArrived := make(chan struct{})
+			releaseSlow := make(chan struct{})
+			sids := make(chan string, 8)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sid := r.Header.Get("Mcp-Session-Id")
+				switch r.Method {
+				case http.MethodGet:
+					sids <- "GET:" + sid
+					sseHeaders(w)
+					<-r.Context().Done()
+					return
+				case http.MethodDelete:
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				method, id := rpcMethod(t, r)
+				switch method {
+				case "initialize":
+					w.Header().Set("Mcp-Session-Id", fmt.Sprintf("S%d", initN.Add(1)))
+					writeJSONResult(w, id)
+				case "slow":
+					close(slowArrived)
+					<-releaseSlow
+					// Сервер подтверждает сессию, с которой пришёл запрос.
+					w.Header().Set("Mcp-Session-Id", sid)
+					if status == http.StatusAccepted {
+						w.WriteHeader(http.StatusAccepted)
+						return
+					}
+					writeJSONResult(w, id)
+				default:
+					sids <- "POST:" + sid
+					writeJSONResult(w, id)
+				}
+			}))
+			defer srv.Close()
+
+			c := newClient(t, srv.URL, nil)
+			ctx := context.Background()
+
+			ch, _ := c.Send(ctx, request(1, "initialize"))
+			collect(t, ch, 2*time.Second)
+
+			slowCh, _ := c.Send(ctx, request(2, "slow"))
+			select {
+			case <-slowArrived:
+			case <-time.After(2 * time.Second):
+				t.Fatal("slow request not received")
+			}
+
+			c.ResetSession()
+			ch, _ = c.Send(ctx, request(3, "initialize"))
+			collect(t, ch, 2*time.Second)
+			if got := c.session.getSessionID(); got != "S2" {
+				t.Fatalf("after re-initialize sessionID=%q, want S2", got)
+			}
+
+			close(releaseSlow)
+			collect(t, slowCh, 2*time.Second)
+			if got := c.session.getSessionID(); got != "S2" {
+				t.Fatalf("stale response overwrote session: %q, want S2", got)
+			}
+
+			ch, _ = c.Send(ctx, request(4, "next"))
+			collect(t, ch, 2*time.Second)
+			if got := <-sids; got != "POST:S2" {
+				t.Fatalf("next POST went with %q, want POST:S2", got)
+			}
+
+			lctx, lcancel := context.WithCancel(ctx)
+			lch, _ := c.Listen(lctx)
+			select {
+			case got := <-sids:
+				if got != "GET:S2" {
+					t.Fatalf("Listen GET went with %q, want GET:S2", got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Listen GET not received")
+			}
+			lcancel()
+			collect(t, lch, 2*time.Second)
+		})
+	}
+}
+
+// slowSessionServer — сервер: initialize выдаёт S1, "slow" ждёт release и отвечает 404.
+func slowSessionServer(t *testing.T) (srv *httptest.Server, arrived, release chan struct{}) {
+	t.Helper()
+	arrived = make(chan struct{})
+	release = make(chan struct{})
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		method, id := rpcMethod(t, r)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "S1")
+			writeJSONResult(w, id)
+		case "slow":
+			close(arrived)
+			<-release
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	return srv, arrived, release
+}
+
+// 404 на запрос, ушедший с S1, — ErrSessionLost, даже если к моменту ответа
+// sid уже сброшен recovery.
+func TestSend_404_AfterReset_IsSessionLost(t *testing.T) {
+	srv, arrived, release := slowSessionServer(t)
+	defer srv.Close()
+	c := newClient(t, srv.URL, nil)
+	ctx := context.Background()
+
+	ch, _ := c.Send(ctx, request(1, "initialize"))
+	collect(t, ch, 2*time.Second)
+
+	slowCh, _ := c.Send(ctx, request(2, "slow"))
+	select {
+	case <-arrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow request not received")
+	}
+	c.ResetSession()
+	close(release)
+
+	got := collect(t, slowCh, 2*time.Second)
+	if len(got) != 1 || !errors.Is(got[0].Err, proxy.ErrSessionLost) {
+		t.Fatalf("expected ErrSessionLost, got %+v", got)
+	}
+}
+
+// Обратный случай: запрос ушёл без sid, а до его 404 другой запрос установил
+// сессию → обычная http 404, не ErrSessionLost.
+func TestSend_404_SentWithoutSession_StaysHTTPError(t *testing.T) {
+	srv, arrived, release := slowSessionServer(t)
+	defer srv.Close()
+	c := newClient(t, srv.URL, nil)
+	ctx := context.Background()
+
+	slowCh, _ := c.Send(ctx, request(1, "slow"))
+	select {
+	case <-arrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow request not received")
+	}
+	ch, _ := c.Send(ctx, request(2, "initialize"))
+	collect(t, ch, 2*time.Second)
+	if got := c.session.getSessionID(); got != "S1" {
+		t.Fatalf("sessionID=%q, want S1", got)
+	}
+	close(release)
+
+	got := collect(t, slowCh, 2*time.Second)
+	if len(got) != 1 || got[0].Err == nil {
+		t.Fatalf("expected single err, got %+v", got)
+	}
+	if errors.Is(got[0].Err, proxy.ErrSessionLost) {
+		t.Fatalf("request sent without session must not be ErrSessionLost: %v", got[0].Err)
+	}
+	if !strings.Contains(got[0].Err.Error(), "http 404") {
+		t.Fatalf("err=%v, want http 404", got[0].Err)
 	}
 }

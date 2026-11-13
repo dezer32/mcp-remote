@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -92,14 +94,18 @@ type fakeRemote struct {
 	mu sync.Mutex
 	// handler — функция, принимающая отправляемое сообщение и возвращающая канал ответа.
 	handler func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error)
-	// listenHandler — функция для GET SSE.
-	listenHandler func(ctx context.Context) (<-chan MessageOrError, error)
+	// listenHandler — функция для GET SSE; n — порядковый номер вызова Listen (с 1).
+	listenHandler func(ctx context.Context, n int) (<-chan MessageOrError, error)
 
 	// Tracking.
 	sent             []jsonrpc.Message
 	resetCount       int
+	listenCount      int
 	protocolVersions []string
 	closed           bool
+	// events — журнал в порядке наступления: send:<method>, reset,
+	// listen-start/N и события, которые пишут сами handler-ы (logEvent).
+	events []string
 }
 
 func newFakeRemote() *fakeRemote {
@@ -109,6 +115,11 @@ func newFakeRemote() *fakeRemote {
 func (r *fakeRemote) Send(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
 	r.mu.Lock()
 	r.sent = append(r.sent, msg)
+	method := msg.Method
+	if method == "" {
+		method = "response"
+	}
+	r.events = append(r.events, "send:"+method)
 	h := r.handler
 	r.mu.Unlock()
 	if h == nil {
@@ -121,6 +132,9 @@ func (r *fakeRemote) Send(ctx context.Context, msg jsonrpc.Message) (<-chan Mess
 
 func (r *fakeRemote) Listen(ctx context.Context) (<-chan MessageOrError, error) {
 	r.mu.Lock()
+	r.listenCount++
+	n := r.listenCount
+	r.events = append(r.events, fmt.Sprintf("listen-start/%d", n))
 	h := r.listenHandler
 	r.mu.Unlock()
 	if h == nil {
@@ -129,7 +143,7 @@ func (r *fakeRemote) Listen(ctx context.Context) (<-chan MessageOrError, error) 
 		close(ch)
 		return ch, nil
 	}
-	return h(ctx)
+	return h(ctx, n)
 }
 
 func (r *fakeRemote) SetProtocolVersion(v string) {
@@ -141,6 +155,7 @@ func (r *fakeRemote) SetProtocolVersion(v string) {
 func (r *fakeRemote) ResetSession() {
 	r.mu.Lock()
 	r.resetCount++
+	r.events = append(r.events, "reset")
 	r.mu.Unlock()
 }
 
@@ -171,6 +186,39 @@ func (r *fakeRemote) ProtocolVersions() []string {
 	out := make([]string, len(r.protocolVersions))
 	copy(out, r.protocolVersions)
 	return out
+}
+
+func (r *fakeRemote) ListenCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.listenCount
+}
+
+// logEvent дописывает событие в журнал (для handler-ов теста).
+func (r *fakeRemote) logEvent(e string) {
+	r.mu.Lock()
+	r.events = append(r.events, e)
+	r.mu.Unlock()
+}
+
+func (r *fakeRemote) Events() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// blockingListen — стрим без сообщений, живущий до отмены ctx; при отмене пишет
+// listen-cancel/N и закрывает канал.
+func (r *fakeRemote) blockingListen(ctx context.Context, n int) (<-chan MessageOrError, error) {
+	ch := make(chan MessageOrError)
+	go func() {
+		<-ctx.Done()
+		r.logEvent(fmt.Sprintf("listen-cancel/%d", n))
+		close(ch)
+	}()
+	return ch, nil
 }
 
 // ---------- helpers ----------
@@ -314,7 +362,8 @@ func TestServerInitiatedListen(t *testing.T) {
 		Method:  "notifications/ping",
 	}}
 
-	rm.listenHandler = func(ctx context.Context) (<-chan MessageOrError, error) {
+	rm.handler = handshakeHandler(nil)
+	rm.listenHandler = func(ctx context.Context, n int) (<-chan MessageOrError, error) {
 		return listenCh, nil
 	}
 
@@ -323,6 +372,9 @@ func TestServerInitiatedListen(t *testing.T) {
 	defer cancel()
 
 	wait := runProxy(t, p, ctx)
+
+	// Listener стартует только после initialize + initialized.
+	handshake(t, tr)
 
 	got, ok := tr.ExpectOut(2 * time.Second)
 	if !ok {
@@ -788,5 +840,722 @@ func TestClientResponseForwarded(t *testing.T) {
 	tr.Close()
 	if err := wait(); err != nil {
 		t.Fatalf("Run returned err: %v", err)
+	}
+}
+
+// ---------- listener / recovery: хелперы ----------
+
+type remoteHandler = func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error)
+
+// chanOf — закрытый канал с заданными элементами.
+func chanOf(items ...MessageOrError) <-chan MessageOrError {
+	ch := make(chan MessageOrError, len(items))
+	for _, it := range items {
+		ch <- it
+	}
+	close(ch)
+	return ch
+}
+
+func initResponse(id json.RawMessage) jsonrpc.Message {
+	return jsonrpc.Message{
+		JSONRPC: jsonrpc.Version,
+		ID:      id,
+		Result:  json.RawMessage(`{"protocolVersion":"2025-03-26"}`),
+	}
+}
+
+// handshakeHandler: initialize → response, notification → закрытый канал (202),
+// прочие запросы — extra (nil → успешный response).
+func handshakeHandler(extra remoteHandler) remoteHandler {
+	return func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+		switch {
+		case msg.Method == methodInitialize:
+			return chanOf(MessageOrError{Msg: initResponse(msg.ID)}), nil
+		case msg.IsNotification():
+			return chanOf(), nil
+		case extra != nil:
+			return extra(ctx, msg)
+		}
+		return chanOf(MessageOrError{Msg: makeResponse(idFromRaw(msg.ID), `{}`)}), nil
+	}
+}
+
+// handshake — initialize (id=1) с ожиданием ответа + notifications/initialized.
+func handshake(t *testing.T, tr *fakeTransport) {
+	t.Helper()
+	tr.PushIn(makeRequest(1, methodInitialize))
+	got, ok := tr.ExpectOut(2 * time.Second)
+	if !ok || idFromRaw(got.ID) != 1 {
+		t.Fatalf("initialize response missing: %+v", got)
+	}
+	tr.PushIn(makeNotification(methodNotifInitialized))
+}
+
+// expectSuccess ждёт успешный response с заданным id.
+func expectSuccess(t *testing.T, tr *fakeTransport, id int) {
+	t.Helper()
+	got, ok := tr.ExpectOut(3 * time.Second)
+	if !ok {
+		t.Fatalf("response id=%d missing", id)
+	}
+	if idFromRaw(got.ID) != id || got.Error != nil {
+		t.Fatalf("expected success id=%d, got %+v (err=%v)", id, got, got.Error)
+	}
+}
+
+// waitFor поллит cond до 3 с.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func indexOf(events []string, e string) int {
+	for i, v := range events {
+		if v == e {
+			return i
+		}
+	}
+	return -1
+}
+
+func lastIndexOf(events []string, e string) int {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i] == e {
+			return i
+		}
+	}
+	return -1
+}
+
+// ---------- listener / recovery: тесты ----------
+
+// До initialized Listen не вызывается, после — ровно один раз.
+func TestListenerStartsAfterInitialized(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	rm.handler = handshakeHandler(nil)
+	rm.listenHandler = rm.blockingListen
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	tr.PushIn(makeRequest(1, methodInitialize))
+	expectSuccess(t, tr, 1)
+	tr.PushIn(makeRequest(2, "tools/list"))
+	expectSuccess(t, tr, 2)
+	if n := rm.ListenCount(); n != 0 {
+		t.Fatalf("Listen called %d times before initialized, want 0", n)
+	}
+
+	tr.PushIn(makeNotification(methodNotifInitialized))
+	waitFor(t, "listener start", func() bool { return rm.ListenCount() == 1 })
+
+	tr.PushIn(makeRequest(3, "tools/list"))
+	expectSuccess(t, tr, 3)
+	if n := rm.ListenCount(); n != 1 {
+		t.Fatalf("Listen called %d times, want 1", n)
+	}
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+	if indexOf(rm.Events(), "listen-cancel/1") < 0 {
+		t.Fatalf("listener not cancelled on shutdown: %v", rm.Events())
+	}
+}
+
+// Исходный initialized получил ErrSessionLost → listener стартует ровно один раз,
+// после replay initialized.
+func TestListenerStartsAfterInitializedReplay(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	var notifN atomic.Int32
+	rm.handler = func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+		if msg.Method == methodNotifInitialized && notifN.Add(1) == 1 {
+			return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+		}
+		return handshakeHandler(nil)(ctx, msg)
+	}
+	rm.listenHandler = rm.blockingListen
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	waitFor(t, "listener start after replay", func() bool { return rm.ListenCount() == 1 })
+	if n := rm.ResetCount(); n != 1 {
+		t.Fatalf("ResetCount=%d, want 1", n)
+	}
+
+	tr.PushIn(makeRequest(2, "tools/list"))
+	expectSuccess(t, tr, 2)
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+	ev := rm.Events()
+	if n := rm.ListenCount(); n != 1 {
+		t.Fatalf("Listen called %d times, want 1: %v", n, ev)
+	}
+	if indexOf(ev, "listen-start/1") < lastIndexOf(ev, "send:"+methodNotifInitialized) {
+		t.Fatalf("listener started before replayed initialized: %v", ev)
+	}
+}
+
+// Recovery останавливает listener до ResetSession и перезапускает после replay.
+func TestRecoveryStopsAndRestartsListener(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	var initN, listN atomic.Int32
+	replayArrived := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	rm.handler = func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+		switch msg.Method {
+		case methodInitialize:
+			k := initN.Add(1)
+			ch := make(chan MessageOrError, 1)
+			go func() {
+				defer close(ch)
+				if k == 2 {
+					close(replayArrived)
+					select {
+					case <-releaseReplay:
+					case <-ctx.Done():
+						return
+					}
+				}
+				rm.logEvent(fmt.Sprintf("respond:initialize/%d", k))
+				ch <- MessageOrError{Msg: initResponse(msg.ID)}
+			}()
+			return ch, nil
+		case "tools/list":
+			if listN.Add(1) == 1 {
+				return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+			}
+		}
+		return handshakeHandler(nil)(ctx, msg)
+	}
+	rm.listenHandler = rm.blockingListen
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	waitFor(t, "first listener", func() bool { return rm.ListenCount() == 1 })
+
+	tr.PushIn(makeRequest(2, "tools/list"))
+	select {
+	case <-replayArrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay initialize not sent")
+	}
+	ev := rm.Events()
+	if c, r := indexOf(ev, "listen-cancel/1"), indexOf(ev, "reset"); c < 0 || r < 0 || c > r {
+		t.Fatalf("listener must be cancelled before reset: %v", ev)
+	}
+	if indexOf(ev, "listen-start/2") >= 0 {
+		t.Fatalf("listener restarted during recovery: %v", ev)
+	}
+
+	close(releaseReplay)
+	expectSuccess(t, tr, 2)
+	waitFor(t, "listener restart", func() bool { return rm.ListenCount() == 2 })
+
+	ev = rm.Events()
+	start2 := indexOf(ev, "listen-start/2")
+	if start2 < indexOf(ev, "respond:initialize/2") || start2 < lastIndexOf(ev, "send:"+methodNotifInitialized) {
+		t.Fatalf("listener restarted before replay finished: %v", ev)
+	}
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+	if n := rm.ListenCount(); n != 2 {
+		t.Fatalf("Listen called %d times, want 2: %v", n, rm.Events())
+	}
+}
+
+// 404 на listener-е → ровно один recovery и один перезапуск listener-а.
+func TestListenerSessionLostOneRecovery(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	rm.handler = handshakeHandler(nil)
+	rm.listenHandler = func(ctx context.Context, n int) (<-chan MessageOrError, error) {
+		if n == 1 {
+			return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+		}
+		return rm.blockingListen(ctx, n)
+	}
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	waitFor(t, "listener restart", func() bool { return rm.ListenCount() == 2 })
+	tr.PushIn(makeRequest(2, "tools/list"))
+	expectSuccess(t, tr, 2)
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+	if n := rm.ResetCount(); n != 1 {
+		t.Fatalf("ResetCount=%d, want 1", n)
+	}
+	if n := rm.ListenCount(); n != 2 {
+		t.Fatalf("ListenCount=%d, want 2", n)
+	}
+}
+
+// Повторные сигналы до начала прохода схлопываются в один.
+func TestTriggerRecoveryCoalesces(t *testing.T) {
+	p := New(newFakeTransport(), newFakeRemote(), logging.Discard())
+	for i := 0; i < 3; i++ {
+		p.triggerRecovery()
+	}
+	if n := len(p.recoveryTrigger); n != 1 {
+		t.Fatalf("signals in channel=%d, want 1", n)
+	}
+	p.mu.Lock()
+	pending := p.recoveryPending
+	p.mu.Unlock()
+	if !pending {
+		t.Fatal("recoveryPending=false, want true")
+	}
+}
+
+// Запрос listener-а при простое: возвращается (без самоблокировки на mu) и
+// ставит ровно один сигнал.
+func TestListenerRequestEnqueuesOnce(t *testing.T) {
+	p := New(newFakeTransport(), newFakeRemote(), logging.Discard())
+	done := make(chan struct{})
+	go func() {
+		p.requestRecoveryFromListener()
+		p.requestRecoveryFromListener()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("requestRecoveryFromListener deadlocked")
+	}
+	if n := len(p.recoveryTrigger); n != 1 {
+		t.Fatalf("signals in channel=%d, want 1", n)
+	}
+}
+
+// Сигнал вычитан, но проход ещё не начался (pending=true), либо проход идёт —
+// запрос listener-а сигнал не добавляет.
+func TestListenerRequestSkippedInDequeueGap(t *testing.T) {
+	p := New(newFakeTransport(), newFakeRemote(), logging.Discard())
+
+	p.triggerRecovery()
+	<-p.recoveryTrigger // имитация runRecovery до захвата mu: pending ещё true
+	p.requestRecoveryFromListener()
+	if n := len(p.recoveryTrigger); n != 0 {
+		t.Fatalf("dequeue gap: signals=%d, want 0", n)
+	}
+
+	p.mu.Lock()
+	p.recoveryPending = false
+	p.recoveryRunning = true
+	p.mu.Unlock()
+	p.requestRecoveryFromListener()
+	if n := len(p.recoveryTrigger); n != 0 {
+		t.Fatalf("running: signals=%d, want 0", n)
+	}
+}
+
+// POST получает 404 после снимка идущего recovery → второй проход реплеит его.
+func TestPostSignalAfterSnapshotRunsSecondPass(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	var initN, calls2, calls3 atomic.Int32
+	replayArrived := make(chan struct{})
+	releaseReplay := make(chan struct{})
+	req3Arrived := make(chan struct{})
+	release3 := make(chan struct{})
+	rm.handler = func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+		switch msg.Method {
+		case methodInitialize:
+			k := initN.Add(1)
+			ch := make(chan MessageOrError, 1)
+			go func() {
+				defer close(ch)
+				if k == 2 {
+					close(replayArrived)
+					select {
+					case <-releaseReplay:
+					case <-ctx.Done():
+						return
+					}
+				}
+				ch <- MessageOrError{Msg: initResponse(msg.ID)}
+			}()
+			return ch, nil
+		case "tools/list":
+			switch idFromRaw(msg.ID) {
+			case 2:
+				if calls2.Add(1) == 1 {
+					return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+				}
+			case 3:
+				if calls3.Add(1) == 1 {
+					ch := make(chan MessageOrError, 1)
+					go func() {
+						defer close(ch)
+						close(req3Arrived)
+						<-release3
+						ch <- MessageOrError{Err: ErrSessionLost}
+					}()
+					return ch, nil
+				}
+			}
+		}
+		return handshakeHandler(nil)(ctx, msg)
+	}
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+
+	// id=3 в полёте до начала recovery.
+	tr.PushIn(makeRequest(3, "tools/list"))
+	<-req3Arrived
+	// id=2 запускает первый проход; снимок берётся до replay initialize.
+	tr.PushIn(makeRequest(2, "tools/list"))
+	select {
+	case <-replayArrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replay initialize not sent")
+	}
+	// id=3 теряет сессию уже после снимка.
+	close(release3)
+	waitFor(t, "id=3 queued for second pass", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.recoveryPending && len(p.pendingReplay) == 1
+	})
+	close(releaseReplay)
+
+	seen := map[int]bool{}
+	for i := 0; i < 2; i++ {
+		got, ok := tr.ExpectOut(3 * time.Second)
+		if !ok {
+			t.Fatalf("missing responses, got %v", seen)
+		}
+		if got.Error != nil {
+			t.Fatalf("unexpected error response: %+v", got.Error)
+		}
+		seen[idFromRaw(got.ID)] = true
+	}
+	if !seen[2] || !seen[3] {
+		t.Fatalf("expected responses for 2 and 3, got %v", seen)
+	}
+	if n := rm.ResetCount(); n != 2 {
+		t.Fatalf("ResetCount=%d, want 2 (second pass)", n)
+	}
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+}
+
+// Recovery ждёт закрытия канала Listen (HTTP-продюсер завершён) до ResetSession.
+// post404 — listener останавливает recovery (stopListener, join через основной
+// цикл чтения); listener404 — listener сам получил session-lost и вышел раньше
+// закрытия канала (join через дренаж в defer runListener).
+func TestStopListenerJoinsProducer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		listenerErr bool
+	}{
+		{name: "post404"},
+		{name: "listener404", listenerErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newFakeTransport()
+			rm := newFakeRemote()
+			var listN atomic.Int32
+			rm.handler = handshakeHandler(func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+				if !tc.listenerErr && listN.Add(1) == 1 {
+					return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+				}
+				return chanOf(MessageOrError{Msg: makeResponse(idFromRaw(msg.ID), `{}`)}), nil
+			})
+			producerCancelled := make(chan struct{})
+			release := make(chan struct{})
+			rm.listenHandler = func(ctx context.Context, n int) (<-chan MessageOrError, error) {
+				if n > 1 {
+					return rm.blockingListen(ctx, n)
+				}
+				ch := make(chan MessageOrError, 1)
+				if tc.listenerErr {
+					ch <- MessageOrError{Err: ErrSessionLost}
+				}
+				go func() {
+					// Продюсер закрывает канал не сразу после отмены ctx.
+					<-ctx.Done()
+					close(producerCancelled)
+					<-release
+					rm.logEvent("producer-done")
+					close(ch)
+				}()
+				return ch, nil
+			}
+
+			p := New(tr, rm, logging.Discard())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			wait := runProxy(t, p, ctx)
+
+			handshake(t, tr)
+			waitFor(t, "listener start", func() bool { return rm.ListenCount() >= 1 })
+			if !tc.listenerErr {
+				tr.PushIn(makeRequest(2, "tools/list"))
+			}
+
+			select {
+			case <-producerCancelled:
+			case <-time.After(3 * time.Second):
+				t.Fatal("listener producer not cancelled by recovery")
+			}
+			// Продюсер ещё не закрыл канал → recovery обязан ждать.
+			if n := rm.ResetCount(); n != 0 {
+				t.Fatalf("ResetSession called before producer finished (ResetCount=%d)", n)
+			}
+			close(release)
+			if tc.listenerErr {
+				waitFor(t, "listener restart", func() bool { return rm.ListenCount() == 2 })
+			} else {
+				expectSuccess(t, tr, 2)
+			}
+
+			ev := rm.Events()
+			if d, r := indexOf(ev, "producer-done"), indexOf(ev, "reset"); d < 0 || r < 0 || d > r {
+				t.Fatalf("producer must finish before reset: %v", ev)
+			}
+
+			tr.Close()
+			if err := wait(); err != nil {
+				t.Fatalf("Run returned err: %v", err)
+			}
+		})
+	}
+}
+
+// После возврата replayInitialize его SSE-продюсер получает отмену ctx.
+func TestReplayInitializeCancelsProducer(t *testing.T) {
+	rm := newFakeRemote()
+	producerDone := make(chan struct{})
+	rm.handler = func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+		ch := make(chan MessageOrError, 1)
+		go func() {
+			defer close(ch)
+			ch <- MessageOrError{Msg: initResponse(msg.ID)}
+			// Стрим держится открытым до отмены ctx.
+			<-ctx.Done()
+			close(producerDone)
+		}()
+		return ch, nil
+	}
+	p := New(newFakeTransport(), rm, logging.Discard())
+
+	if err := p.replayInitialize(context.Background(), makeRequest(1, methodInitialize)); err != nil {
+		t.Fatalf("replayInitialize: %v", err)
+	}
+	select {
+	case <-producerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replay initialize producer still running after return")
+	}
+}
+
+// Нетерминальная ошибка в стриме (битое SSE-событие) не останавливает listener.
+func TestListenerKeepsReadingAfterDecodeError(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	rm.handler = handshakeHandler(nil)
+	rm.listenHandler = func(ctx context.Context, n int) (<-chan MessageOrError, error) {
+		ch := make(chan MessageOrError, 2)
+		ch <- MessageOrError{Err: errors.New("decode: invalid character")}
+		ch <- MessageOrError{Msg: makeNotification("notifications/ping")}
+		go func() {
+			<-ctx.Done()
+			close(ch)
+		}()
+		return ch, nil
+	}
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	got, ok := tr.ExpectOut(2 * time.Second)
+	if !ok || got.Method != "notifications/ping" {
+		t.Fatalf("expected ping after decode error, got %+v (ok=%v)", got, ok)
+	}
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+}
+
+// Сбой recovery при активном listener-е → Run возвращает ошибку, не зависает.
+func TestRunExitsWhenRecoveryFailsWithListener(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	var initN atomic.Int32
+	rm.handler = func(ctx context.Context, msg jsonrpc.Message) (<-chan MessageOrError, error) {
+		switch msg.Method {
+		case methodInitialize:
+			if initN.Add(1) > 1 {
+				return chanOf(MessageOrError{Err: errors.New("boom")}), nil
+			}
+		case "tools/list":
+			return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+		}
+		return handshakeHandler(nil)(ctx, msg)
+	}
+	rm.listenHandler = rm.blockingListen
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	waitFor(t, "listener start", func() bool { return rm.ListenCount() == 1 })
+
+	tr.PushIn(makeRequest(2, "tools/list"))
+	got, ok := tr.ExpectOut(3 * time.Second)
+	if !ok || got.Error == nil || idFromRaw(got.ID) != 2 {
+		t.Fatalf("expected error response for id=2, got %+v", got)
+	}
+	if err := wait(); err == nil {
+		t.Fatal("expected Run error on recovery fail")
+	}
+	if indexOf(rm.Events(), "listen-cancel/1") < 0 {
+		t.Fatalf("listener not cancelled: %v", rm.Events())
+	}
+}
+
+// Отмена ctx при активном listener-е → Run возвращается.
+func TestRunExitsOnCancelWithListener(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	rm.handler = handshakeHandler(nil)
+	rm.listenHandler = rm.blockingListen
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	waitFor(t, "listener start", func() bool { return rm.ListenCount() == 1 })
+
+	cancel()
+	if err := wait(); err != nil {
+		t.Fatalf("expected nil on ctx cancel, got %v", err)
+	}
+	if indexOf(rm.Events(), "listen-cancel/1") < 0 {
+		t.Fatalf("listener not cancelled: %v", rm.Events())
+	}
+}
+
+// Session-lost реже окна счётчика не копятся до лимита.
+func TestRecoveryAttemptsWindow(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	rm.handler = handshakeHandler(nil)
+	const losses = 5
+	rm.listenHandler = func(ctx context.Context, n int) (<-chan MessageOrError, error) {
+		if n > losses {
+			return rm.blockingListen(ctx, n)
+		}
+		ch := make(chan MessageOrError, 1)
+		go func() {
+			defer close(ch)
+			select {
+			case <-time.After(40 * time.Millisecond): // > recoveryWindow
+				ch <- MessageOrError{Err: ErrSessionLost}
+			case <-ctx.Done():
+			}
+		}()
+		return ch, nil
+	}
+
+	p := New(tr, rm, logging.Discard())
+	p.recoveryWindow = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	waitFor(t, "all recoveries", func() bool { return rm.ListenCount() == losses+1 })
+	select {
+	case <-p.recoveryFail:
+		t.Fatal("recovery failed: attempts must reset after window")
+	default:
+	}
+	if n := rm.ResetCount(); n != losses {
+		t.Fatalf("ResetCount=%d, want %d", n, losses)
+	}
+
+	tr.Close()
+	if err := wait(); err != nil {
+		t.Fatalf("Run returned err: %v", err)
+	}
+}
+
+// 404 на каждый GET без пауз → выход по лимиту попыток.
+func TestRecoveryAttemptsExceeded(t *testing.T) {
+	tr := newFakeTransport()
+	rm := newFakeRemote()
+	rm.handler = handshakeHandler(nil)
+	rm.listenHandler = func(ctx context.Context, n int) (<-chan MessageOrError, error) {
+		return chanOf(MessageOrError{Err: ErrSessionLost}), nil
+	}
+
+	p := New(tr, rm, logging.Discard())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wait := runProxy(t, p, ctx)
+
+	handshake(t, tr)
+	err := wait()
+	if err == nil {
+		t.Fatal("expected Run error after exceeding recovery attempts")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if n := rm.ResetCount(); n != maxRecoveryAttempts {
+		t.Fatalf("ResetCount=%d, want %d", n, maxRecoveryAttempts)
 	}
 }
