@@ -71,6 +71,7 @@ var reservedHeaders = map[string]struct{}{
 	"host":                 {},
 	"transfer-encoding":    {},
 	"connection":           {},
+	"upgrade":              {},
 }
 
 // usageText — короткий help-блок. Печатается в stderr при --help.

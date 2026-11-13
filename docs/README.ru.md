@@ -115,14 +115,14 @@ mcp-remote <server-url> [port] [flags]
 | Флаг | Аргумент | Описание |
 |------|----------|----------|
 | `--header` | `"K: V"` | HTTP-заголовок, добавляется ко всем запросам. Можно повторять. Поддерживает `${ENV}` интерполяцию. |
-| `--allow-http` | — | Разрешить не-HTTPS `server-url` (по умолчанию запрещён). |
+| `--allow-http` | — | Разрешить не-HTTPS `server-url` и `http://`-эндпоинты OAuth (`resource_metadata`, сервер авторизации, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`). По умолчанию запрещено; только для разработки. |
 | `--debug` | — | Verbose-логи в stderr (уровень DEBUG). |
 | `--silent` | — | Логировать только ошибки (уровень ERROR). |
 | `--auth-timeout` | `30s` / `30` | Таймаут ожидания OAuth callback. Принимает Go duration (`30s`, `2m`) или число секунд. По умолчанию `30s`. |
 | `--static-oauth-client-metadata` | `<json>` или `@<path>` | Переопределить client_metadata для DCR. JSON inline или `@file.json`. |
 | `--static-oauth-client-info` | `<json>` или `@<path>` | Готовый `client_id` (и при необходимости `client_secret`) — DCR пропускается. |
 | `--resource` | `<uri>` | Переопределить RFC9728 `resource` URI (по умолчанию автодискавери). |
-| `--host` | `127.0.0.1` | Bind host для локального OAuth callback. По умолчанию `127.0.0.1`. |
+| `--host` | `127.0.0.1` | Bind host для локального OAuth callback. По умолчанию `127.0.0.1`. Не-loopback адрес (например, `0.0.0.0`) делает callback доступным из сети и пишет предупреждение в лог. |
 | `--config-dir` | `<path>` | Корень хранения токенов и OAuth-метаданных. |
 
 Позиционные аргументы: первый — обязательный URL remote MCP-сервера,
@@ -134,7 +134,7 @@ mcp-remote <server-url> [port] [flags]
 | Переменная | Назначение |
 |------------|------------|
 | `MCP_REMOTE_CONFIG_DIR` | Переопределяет корень хранения токенов (эквивалент `--config-dir`, флаг имеет приоритет). |
-| `BROWSER` | Путь к executable, который открывает OAuth-URL. Если задан — перебивает `open` / `xdg-open` / `cmd /c start`. |
+| `BROWSER` | Путь к executable, который открывает OAuth-URL. Если задан — перебивает `open` / `xdg-open` / `rundll32 url.dll,FileProtocolHandler` (Windows). URL проверяется до запуска (абсолютный `http`/`https`, без userinfo и пробельных символов) и передаётся одним аргументом, командная оболочка не участвует. |
 
 ## OAuth
 
@@ -202,13 +202,29 @@ Remove-Item -Recurse -Force "$env:AppData\mcp-remote\<hash16>"
   сервера (см. выше) и перезапустите клиент.
 - **HTTP вместо HTTPS** — в dev-окружении добавьте `--allow-http`. В
   production этого делать **не следует**.
+- **`AS metadata issuer ... does not match authorization server ...`** —
+  `issuer` в метаданных сервера авторизации не совпадает с
+  идентификатором, по которому документ запрошен (RFC 8414 §3.3;
+  один завершающий `/` не учитывается). Обычно это ошибка конфигурации
+  сервера; обхода нет.
+- **`protected resource metadata resource ... does not match server URL ...`** —
+  `resource` из метаданных RFC 9728 должен иметь тот же origin, что и
+  server URL, а путь server URL — совпадать с путём `resource` или
+  лежать под ним. `--resource <uri>` отключает эту проверку и задаёт
+  ваше значение.
 
 ## Безопасность
 
 - HTTPS обязателен. Не-HTTPS URL отвергается, пока не передан
-  `--allow-http` (только для разработки).
-- Cross-origin редиректы при обмене на token endpoint блокируются —
-  защита от утечки `code` / `refresh_token` на сторонний хост.
+  `--allow-http` (только для разработки). Флаг распространяется и на
+  OAuth-эндпоинты из метаданных сервера (`resource_metadata`, сервер
+  авторизации, `authorization_endpoint`, `token_endpoint`,
+  `registration_endpoint`): без него это должны быть абсолютные `https`
+  URL, а схемы кроме `http`/`https` отклоняются и с флагом.
+- POST на token и registration endpoint не следуют редиректам — защита
+  от утечки `code` / `refresh_token` / `client_secret` на сторонний хост.
+  Discovery (GET) следует не более чем 5 редиректам и не понижает
+  `https` до `http`.
 - Reserved headers (`Mcp-Session-Id`, `Accept`, `Content-Type`,
   `Content-Length`, `Host`, `Connection`, `Upgrade` и пр.) нельзя
   переопределить через `--header` — попытка приведёт к ошибке валидации.

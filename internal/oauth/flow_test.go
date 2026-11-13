@@ -88,7 +88,7 @@ func newASFixture(t *testing.T) *asFixture {
 
 	f.mux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"resource":              f.srv.URL + "/resource",
+			"resource":              "https://mcp.example/server",
 			"authorization_servers": []string{f.srv.URL},
 		})
 	})
@@ -240,6 +240,7 @@ func TestHandleUnauthorizedEndToEnd(t *testing.T) {
 
 	cfg := &config.Config{
 		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
 		ConfigDir:   t.TempDir(),
 		AuthTimeout: 10 * time.Second,
 	}
@@ -300,6 +301,7 @@ func TestHandleUnauthorizedStaticClientNoDCR(t *testing.T) {
 	staticCI, _ := json.Marshal(map[string]any{"client_id": "static-1"})
 	cfg := &config.Config{
 		ServerURL:                 "https://mcp.example/server",
+		AllowHTTP:                 true,
 		ConfigDir:                 t.TempDir(),
 		AuthTimeout:               5 * time.Second,
 		StaticOAuthClientInfoJSON: staticCI,
@@ -345,6 +347,7 @@ func TestHandleUnauthorizedRefreshSuccess(t *testing.T) {
 	opener := newFakeOpener()
 	cfg := &config.Config{
 		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
 		ConfigDir:   t.TempDir(),
 		AuthTimeout: 5 * time.Second,
 	}
@@ -384,6 +387,7 @@ func TestHandleUnauthorizedRefreshFailFallsBackToFullFlow(t *testing.T) {
 	opener := newFakeOpener()
 	cfg := &config.Config{
 		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
 		ConfigDir:   t.TempDir(),
 		AuthTimeout: 5 * time.Second,
 	}
@@ -423,6 +427,7 @@ func TestHandleUnauthorizedNoDCRNoStatic(t *testing.T) {
 	opener := newFakeOpener()
 	cfg := &config.Config{
 		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
 		ConfigDir:   t.TempDir(),
 		AuthTimeout: 1 * time.Second,
 	}
@@ -445,7 +450,7 @@ func TestHandleUnauthorizedCallbackError(t *testing.T) {
 	t.Cleanup(srv.Close)
 	mux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"resource":              "https://api/resource",
+			"resource":              "https://mcp.example/server",
 			"authorization_servers": []string{srv.URL},
 		})
 	})
@@ -469,6 +474,7 @@ func TestHandleUnauthorizedCallbackError(t *testing.T) {
 	opener := newFakeOpener()
 	cfg := &config.Config{
 		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
 		ConfigDir:   t.TempDir(),
 		AuthTimeout: 5 * time.Second,
 	}
@@ -498,6 +504,7 @@ func TestTokenExpiryAndAutoRefresh(t *testing.T) {
 	opener := newFakeOpener()
 	cfg := &config.Config{
 		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
 		ConfigDir:   t.TempDir(),
 		AuthTimeout: 5 * time.Second,
 	}
@@ -612,7 +619,7 @@ func TestPostTokenErrorPath(t *testing.T) {
 		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
 	}))
 	defer srv.Close()
-	p := New(&config.Config{}, &fakeOpener{}, logging.Discard())
+	p := New(&config.Config{AllowHTTP: true}, &fakeOpener{}, logging.Discard())
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	_, err := p.postToken(context.Background(), srv.URL, form)

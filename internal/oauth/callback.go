@@ -4,16 +4,20 @@ package oauth
 //   net.Listen("tcp", host:0) → http.Server на /callback.
 //   host из cfg.Host (default 127.0.0.1).
 //   Принимает ?code=...&state=... либо ?error=...&error_description=...
-//   state валидируется; mismatch → ошибка, токен не запрашивается.
+//   state валидируется (в постоянное время) для code и для error; запрос с
+//   неверным/отсутствующим state получает 400 и ожидание не завершает.
+//   Методы кроме GET получают 405.
 //   Отвечает простой HTML "Authorization complete, you can close this tab".
 //   Graceful shutdown через ctx.
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -96,9 +100,45 @@ func listenCallback(cfg *config.Config, expectedState string) (string, *callback
 	return url, cs, nil
 }
 
-// handle обрабатывает запрос /callback.
+// isLoopbackHost сообщает, слушает ли callback-сервер только loopback:
+// "localhost" (без учёта регистра) или IP, для которого IsLoopback. Пустой
+// host — это defaultHost (127.0.0.1). 0.0.0.0, "::" и произвольные имена
+// хостов не считаются loopback.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.IsLoopback()
+}
+
+// handle обрабатывает запрос /callback. Флоу завершается только GET-запросом
+// с верным state: на callback может постучаться любой локальный процесс или
+// страница в браузере, а легитимный редирект AS всегда несёт state.
 func (s *callbackServer) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	q := r.URL.Query()
+	state := q.Get("state")
+	// Пустой state считаем отсутствующим, даже если ожидаемый почему-то пуст.
+	if state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(s.state)) != 1 {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintln(w, `<!doctype html><html><body><p>Authorization error: invalid or missing state.</p></body></html>`)
+		return
+	}
+
 	var res callbackResult
 	switch {
 	case q.Get("error") != "":
@@ -109,16 +149,10 @@ func (s *callbackServer) handle(w http.ResponseWriter, r *http.Request) {
 		} else {
 			res = callbackResult{err: errors.New(e)}
 		}
+	case q.Get("code") == "":
+		res = callbackResult{err: errors.New("authorization code missing")}
 	default:
-		code := q.Get("code")
-		state := q.Get("state")
-		if state != s.state {
-			res = callbackResult{err: errors.New("state mismatch")}
-		} else if code == "" {
-			res = callbackResult{err: errors.New("authorization code missing")}
-		} else {
-			res = callbackResult{code: code, state: state}
-		}
+		res = callbackResult{code: q.Get("code"), state: state}
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

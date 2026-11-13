@@ -307,6 +307,16 @@ func TestParse_Errors(t *testing.T) {
 			errFrag: "CR, LF or NUL",
 		},
 		{
+			name:    "reserved Upgrade",
+			args:    []string{"https://x", "--header", "Upgrade: websocket"},
+			errFrag: "reserved",
+		},
+		{
+			name:    "reserved upgrade lowercase",
+			args:    []string{"https://x", "--header", "upgrade: h2c"},
+			errFrag: "reserved",
+		},
+		{
 			name:    "reserved Mcp-Session-Id",
 			args:    []string{"https://x", "--header", "Mcp-Session-Id: x"},
 			errFrag: "reserved",

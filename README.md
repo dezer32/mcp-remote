@@ -116,14 +116,14 @@ mcp-remote <server-url> [port] [flags]
 | Flag | Argument | Description |
 |------|----------|-------------|
 | `--header` | `"K: V"` | HTTP header appended to every request. Repeatable. Supports `${ENV}` interpolation. |
-| `--allow-http` | — | Allow non-HTTPS `server-url` (disabled by default). |
+| `--allow-http` | — | Allow non-HTTPS `server-url` and `http://` OAuth endpoints (`resource_metadata`, authorization server, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`). Disabled by default; development only. |
 | `--debug` | — | Verbose logs to stderr (DEBUG level). |
 | `--silent` | — | Log errors only (ERROR level). |
 | `--auth-timeout` | `30s` / `30` | OAuth callback timeout. Accepts a Go duration (`30s`, `2m`) or a number of seconds. Default: `30s`. |
 | `--static-oauth-client-metadata` | `<json>` or `@<path>` | Override client_metadata for DCR. Inline JSON or `@file.json`. |
 | `--static-oauth-client-info` | `<json>` or `@<path>` | Pre-existing `client_id` (and optionally `client_secret`) — DCR is skipped. |
 | `--resource` | `<uri>` | Override the RFC9728 `resource` URI (auto-discovered by default). |
-| `--host` | `127.0.0.1` | Bind host for the local OAuth callback. Default: `127.0.0.1`. |
+| `--host` | `127.0.0.1` | Bind host for the local OAuth callback. Default: `127.0.0.1`. A non-loopback address (e.g. `0.0.0.0`) makes the callback reachable from the network and logs a warning. |
 | `--config-dir` | `<path>` | Root directory for token and OAuth metadata storage. |
 
 Positional arguments: the first is the required remote MCP server URL;
@@ -135,7 +135,7 @@ If omitted or `0`, the OS picks the port.
 | Variable | Purpose |
 |----------|---------|
 | `MCP_REMOTE_CONFIG_DIR` | Overrides the token storage root (equivalent to `--config-dir`; the flag takes precedence). |
-| `BROWSER` | Path to the executable that opens the OAuth URL. When set, it overrides `open` / `xdg-open` / `cmd /c start`. |
+| `BROWSER` | Path to the executable that opens the OAuth URL. When set, it overrides `open` / `xdg-open` / `rundll32 url.dll,FileProtocolHandler` (Windows). The URL is validated before launch (absolute `http`/`https`, no userinfo, no whitespace) and passed as a single argument; no shell is involved. |
 
 ## OAuth
 
@@ -204,14 +204,29 @@ To reset everything at once, remove the entire root directory.
   (see above) and restart the client.
 - **HTTP instead of HTTPS** — in a dev environment, pass `--allow-http`.
   **Do not** do this in production.
+- **`AS metadata issuer ... does not match authorization server ...`** —
+  the `issuer` in the authorization server metadata differs from the
+  server identifier the document was fetched from (RFC 8414 §3.3; a
+  single trailing `/` is ignored). Usually a server misconfiguration;
+  there is no override.
+- **`protected resource metadata resource ... does not match server URL ...`** —
+  the `resource` from the RFC 9728 metadata must have the same origin as
+  the server URL, and the server URL path must equal or sit under the
+  `resource` path. Pass `--resource <uri>` to skip this check and use
+  your own value.
 
 ## Security
 
 - HTTPS is mandatory. Non-HTTPS URLs are rejected unless `--allow-http`
-  is provided (development only).
-- Cross-origin redirects during the token-endpoint exchange are blocked
-  — protection against `code` / `refresh_token` leakage to a third-party
-  host.
+  is provided (development only). The flag also covers the OAuth
+  endpoints taken from server metadata (`resource_metadata`, the
+  authorization server, `authorization_endpoint`, `token_endpoint`,
+  `registration_endpoint`): without it they must be absolute `https`
+  URLs, and schemes other than `http`/`https` are rejected even with it.
+- POST requests to the token and registration endpoints never follow
+  redirects — protection against `code` / `refresh_token` /
+  `client_secret` leakage to a third-party host. Discovery (GET)
+  follows at most 5 redirects and never downgrades `https` to `http`.
 - Reserved headers (`Mcp-Session-Id`, `Accept`, `Content-Type`,
   `Content-Length`, `Host`, `Connection`, `Upgrade`, etc.) cannot be
   overridden via `--header` — attempting to do so fails validation.

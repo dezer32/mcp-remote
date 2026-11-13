@@ -74,6 +74,7 @@ func New(cfg *config.Config, opener Opener, log *slog.Logger) *Provider {
 		log:        log,
 		httpClient: &http.Client{Timeout: defaultHTTPTimeout},
 	}
+	p.httpClient.CheckRedirect = redirectPolicy(p.allowHTTP())
 
 	if cfg != nil && cfg.ServerURL != "" && cfg.ConfigDir != "" {
 		st, err := NewStorage(cfg.ConfigDir, cfg.ServerURL)
@@ -95,6 +96,35 @@ func New(cfg *config.Config, opener Opener, log *slog.Logger) *Provider {
 	}
 
 	return p
+}
+
+// maxRedirects — предел цепочки редиректов GET-запросов discovery.
+const maxRedirects = 5
+
+// redirectPolicy возвращает CheckRedirect для OAuth HTTP-клиента:
+//   - не-GET (POST на token/registration endpoint) редиректам не следует:
+//     в теле code_verifier, refresh_token, client_secret, а Go на 307/308
+//     повторил бы тело на новый адрес. CheckRedirect вызывается до отправки
+//     следующего запроса, так что тело никуда не уходит;
+//   - GET (discovery): не более maxRedirects переходов и без понижения
+//     https → http, если не включён --allow-http.
+func redirectPolicy(allowHTTP bool) func(req *http.Request, via []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		if via[0].Method != http.MethodGet {
+			return fmt.Errorf("oauth: %s %s: redirect to %s not allowed", via[0].Method, via[0].URL.Redacted(), req.URL.Redacted())
+		}
+		if len(via) > maxRedirects {
+			return fmt.Errorf("oauth: GET %s: stopped after %d redirects", via[0].URL.Redacted(), maxRedirects)
+		}
+		prev := via[len(via)-1].URL
+		if prev.Scheme == "https" && req.URL.Scheme == "http" && !allowHTTP {
+			return fmt.Errorf("oauth: redirect from https %s to http %s not allowed (pass --allow-http for development only)", prev.Redacted(), req.URL.Redacted())
+		}
+		return nil
+	}
 }
 
 // Token возвращает текущий access-токен (с авто-refresh при истечении).
@@ -205,6 +235,10 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 		defer cancel()
 		_ = srv.Shutdown(shCtx)
 	}()
+	if !isLoopbackHost(p.cfg.Host) {
+		p.log.Warn("oauth: callback server listens on a non-loopback address; the OAuth callback is reachable from the network",
+			slog.String("host", p.cfg.Host))
+	}
 
 	// 4) DCR (если cachedClient ещё пуст и есть registration endpoint).
 	if p.cachedClient == nil && meta.RegistrationEndpoint != "" {
@@ -226,13 +260,19 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 
 	// 5) Конструируем authorize URL.
 	authURL := buildAuthorizeURL(meta, p.cachedClient, callbackURL, challenge, state, resource)
-	p.log.Info("oauth: opening browser for authorization", slog.String("url", authURL))
 
 	if openErr := p.opener.Open(ctx, authURL); openErr != nil {
+		if errors.Is(openErr, errUnsafeURL) {
+			// URL небезопасен: нигде его не печатаем (ни в лог, ни в stderr),
+			// чтобы пользователь не открыл его вручную, и завершаем авторизацию.
+			return fmt.Errorf("oauth: refusing to open authorization URL: %w", openErr)
+		}
 		// Не фатально: пользователь может открыть URL вручную. Логируем и
 		// печатаем URL в stderr.
 		p.log.Warn("oauth: opener failed", slog.String("error", openErr.Error()))
 		fmt.Fprintf(os.Stderr, "Open this URL to authorize: %s\n", authURL)
+	} else {
+		p.log.Info("oauth: opened browser for authorization", slog.String("url", authURL))
 	}
 
 	// 6) Ждём callback.
@@ -262,6 +302,9 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 
 // registerClient выполняет RFC 7591 Dynamic Client Registration.
 func (p *Provider) registerClient(ctx context.Context, regEndpoint, callbackURL string) (*ClientInfo, error) {
+	if _, err := validateEndpointURL(regEndpoint, p.allowHTTP()); err != nil {
+		return nil, fmt.Errorf("registration endpoint: %w", err)
+	}
 	body := p.dcrBody(callbackURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, regEndpoint, bytes.NewReader(body))
@@ -442,6 +485,11 @@ func (p *Provider) refreshTokensLocked(ctx context.Context) error {
 
 // postToken — общий POST на token endpoint с form-urlencoded body.
 func (p *Provider) postToken(ctx context.Context, endpoint string, form url.Values) (*Tokens, error) {
+	// Проверяем и метаданные, загруженные с диска (в т.ч. старой версией):
+	// секреты в теле не уходят на http/нестандартную схему.
+	if _, err := validateEndpointURL(endpoint, p.allowHTTP()); err != nil {
+		return nil, fmt.Errorf("token endpoint: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("new token request: %w", err)

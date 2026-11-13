@@ -91,6 +91,9 @@ func newTestProvider(t *testing.T, cfg *config.Config) *Provider {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
+	// httptest-серверы отдают http://, поэтому тестовый провайдер по умолчанию
+	// допускает http. Тесты политики HTTPS создают Provider через New напрямую.
+	cfg.AllowHTTP = true
 	return New(cfg, &fakeOpener{}, logging.Discard())
 }
 
@@ -127,8 +130,8 @@ func TestDiscoveryPRMPath(t *testing.T) {
 	prmSrv := httptest.NewServer(prmMux)
 	defer prmSrv.Close()
 
-	p := newTestProvider(t, &config.Config{ServerURL: "https://ignored.example/mcp"})
-	meta, resource, err := p.discover(context.Background(), prmSrv.URL+"/.well-known/oauth-protected-resource", "https://ignored.example/mcp", "")
+	p := newTestProvider(t, &config.Config{ServerURL: "https://api.example.com/mcp"})
+	meta, resource, err := p.discover(context.Background(), prmSrv.URL+"/.well-known/oauth-protected-resource", "https://api.example.com/mcp", "")
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
