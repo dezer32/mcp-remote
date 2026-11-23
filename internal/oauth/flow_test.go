@@ -1,11 +1,14 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +24,7 @@ import (
 // HTTP-запрос на authorize выполняет тестовая горутина, имитирующая user-agent.
 type fakeOpener struct {
 	openedURL chan string
+	calls     atomic.Int32
 }
 
 func newFakeOpener() *fakeOpener {
@@ -28,6 +32,7 @@ func newFakeOpener() *fakeOpener {
 }
 
 func (f *fakeOpener) Open(_ context.Context, u string) error {
+	f.calls.Add(1)
 	select {
 	case f.openedURL <- u:
 	default:
@@ -49,10 +54,13 @@ type asFixture struct {
 	refresh        map[string]string      // refresh_token -> client_id
 	dcrCalls       int
 	tokenCalls     int
+	refreshCalls   int
 	registerHit    bool
 	expiresIn      int64 // ответ token endpoint
 	denyRegister   bool
 	skipDCRSupport bool
+	// omitDCRRedirectURIs — ответ /register без redirect_uris.
+	omitDCRRedirectURIs bool
 }
 
 type codeInfo struct {
@@ -118,7 +126,11 @@ func newASFixture(t *testing.T) *asFixture {
 		}
 		f.clients[clientID] = ci
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ci)
+		resp := *ci
+		if f.omitDCRRedirectURIs {
+			resp.RedirectURIs = nil
+		}
+		_ = json.NewEncoder(w).Encode(&resp)
 	})
 
 	f.mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
@@ -165,6 +177,7 @@ func newASFixture(t *testing.T) *asFixture {
 			at, rt := f.newTokens(ci.clientID)
 			f.writeToken(w, at, rt)
 		case "refresh_token":
+			f.refreshCalls++
 			rt := r.PostFormValue("refresh_token")
 			cid, ok := f.refresh[rt]
 			if !ok {
@@ -248,7 +261,7 @@ func TestHandleUnauthorizedEndToEnd(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate())
+		done <- handleUnauthorized(p, as.wwwAuthenticate())
 	}()
 
 	select {
@@ -310,7 +323,7 @@ func TestHandleUnauthorizedStaticClientNoDCR(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate())
+		done <- handleUnauthorized(p, as.wwwAuthenticate())
 	}()
 
 	select {
@@ -355,7 +368,7 @@ func TestHandleUnauthorizedRefreshSuccess(t *testing.T) {
 
 	// прогон 1: полный flow.
 	done := make(chan error, 1)
-	go func() { done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate()) }()
+	go func() { done <- handleUnauthorized(p, as.wwwAuthenticate()) }()
 	runUserAgent(t, <-opener.openedURL)
 	if err := <-done; err != nil {
 		t.Fatalf("initial auth: %v", err)
@@ -364,7 +377,7 @@ func TestHandleUnauthorizedRefreshSuccess(t *testing.T) {
 
 	// прогон 2: refresh. HandleUnauthorized должен использовать refresh_token и
 	// НЕ вызвать opener.
-	go func() { done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate()) }()
+	go func() { done <- handleUnauthorized(p, as.wwwAuthenticate()) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -395,7 +408,7 @@ func TestHandleUnauthorizedRefreshFailFallsBackToFullFlow(t *testing.T) {
 
 	// первая полная авторизация
 	done := make(chan error, 1)
-	go func() { done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate()) }()
+	go func() { done <- handleUnauthorized(p, as.wwwAuthenticate()) }()
 	runUserAgent(t, <-opener.openedURL)
 	if err := <-done; err != nil {
 		t.Fatalf("initial: %v", err)
@@ -408,7 +421,7 @@ func TestHandleUnauthorizedRefreshFailFallsBackToFullFlow(t *testing.T) {
 	p.mu.Unlock()
 
 	// HandleUnauthorized: refresh упадёт → full flow → opener будет вызван
-	go func() { done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate()) }()
+	go func() { done <- handleUnauthorized(p, as.wwwAuthenticate()) }()
 	select {
 	case u := <-opener.openedURL:
 		runUserAgent(t, u)
@@ -433,7 +446,7 @@ func TestHandleUnauthorizedNoDCRNoStatic(t *testing.T) {
 	}
 	p := New(cfg, opener, logging.Discard())
 
-	err := p.HandleUnauthorized(context.Background(), as.wwwAuthenticate())
+	err := handleUnauthorized(p, as.wwwAuthenticate())
 	if err == nil {
 		t.Fatalf("expected error about no DCR and no static client")
 	}
@@ -482,7 +495,7 @@ func TestHandleUnauthorizedCallbackError(t *testing.T) {
 
 	www := `Bearer resource_metadata="` + srv.URL + `/.well-known/oauth-protected-resource"`
 	done := make(chan error, 1)
-	go func() { done <- p.HandleUnauthorized(context.Background(), www) }()
+	go func() { done <- handleUnauthorized(p, www) }()
 	select {
 	case u := <-opener.openedURL:
 		runUserAgent(t, u)
@@ -512,7 +525,7 @@ func TestTokenExpiryAndAutoRefresh(t *testing.T) {
 
 	// Полная авторизация.
 	done := make(chan error, 1)
-	go func() { done <- p.HandleUnauthorized(context.Background(), as.wwwAuthenticate()) }()
+	go func() { done <- handleUnauthorized(p, as.wwwAuthenticate()) }()
 	runUserAgent(t, <-opener.openedURL)
 	if err := <-done; err != nil {
 		t.Fatalf("auth: %v", err)
@@ -563,7 +576,7 @@ func TestProviderImplementsOpenerAndTokenProvider(t *testing.T) {
 		t.Fatalf("Token on empty cfg: %v", err)
 	}
 	// HandleUnauthorized с пустым ServerURL ожидаемо вернёт ошибку.
-	if err := p.HandleUnauthorized(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "ServerURL") {
+	if err := handleUnauthorized(p, ""); err == nil || !strings.Contains(err.Error(), "ServerURL") {
 		t.Fatalf("unexpected err: %v", err)
 	}
 }
@@ -644,4 +657,464 @@ func TestTokenConcurrentSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// handleUnauthorized — вызов HandleUnauthorized так, как его делает httpmcp на
+// первый 401 запроса: с текущим токеном провайдера и разрешённым refresh.
+// Возвращает только ошибку — для тестов, которым не важен authorized.
+func handleUnauthorized(p *Provider, www string) error {
+	p.mu.Lock()
+	_ = p.ensureLoadedLocked()
+	rejected := ""
+	if p.cachedTokens != nil {
+		rejected = p.cachedTokens.AccessToken
+	}
+	p.mu.Unlock()
+	_, err := p.HandleUnauthorized(context.Background(), www, rejected, true)
+	return err
+}
+
+// --- решение refresh/authorize по цепочке запроса ---------------------------
+
+// authorizeOnce проводит полный флоу (первый 401 без токенов) и возвращает
+// выданный access-токен.
+func authorizeOnce(t *testing.T, p *Provider, as *asFixture, opener *fakeOpener) string {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- handleUnauthorized(p, as.wwwAuthenticate()) }()
+	select {
+	case u := <-opener.openedURL:
+		runUserAgent(t, u)
+	case <-time.After(3 * time.Second):
+		t.Fatal("opener was not called")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("initial auth: %v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cachedTokens.AccessToken
+}
+
+func (f *asFixture) counters() (tokenCalls, refreshCalls, dcrCalls int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tokenCalls, f.refreshCalls, f.dcrCalls
+}
+
+func newChainProvider(t *testing.T, opener *fakeOpener, log *slog.Logger) *Provider {
+	t.Helper()
+	cfg := &config.Config{
+		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
+		ConfigDir:   t.TempDir(),
+		AuthTimeout: 5 * time.Second,
+	}
+	return New(cfg, opener, log)
+}
+
+func TestHandleUnauthorizedReplacedTokenNoNetwork(t *testing.T) {
+	t.Parallel()
+	as := newASFixture(t)
+	opener := newFakeOpener()
+	p := newChainProvider(t, opener, logging.Discard())
+	current := authorizeOnce(t, p, as, opener)
+	tokenBefore, _, _ := as.counters()
+	opensBefore := opener.calls.Load()
+
+	for _, allowRefresh := range []bool{true, false} {
+		authorized, err := p.HandleUnauthorized(context.Background(), as.wwwAuthenticate(), "AT-stale", allowRefresh)
+		if err != nil || authorized {
+			t.Fatalf("allowRefresh=%v: got (%v, %v), want (false, nil)", allowRefresh, authorized, err)
+		}
+	}
+	tokenAfter, _, _ := as.counters()
+	if tokenAfter != tokenBefore {
+		t.Fatalf("token endpoint called %d times for replaced token", tokenAfter-tokenBefore)
+	}
+	if n := opener.calls.Load(); n != opensBefore {
+		t.Fatalf("opener called %d times for replaced token", n-opensBefore)
+	}
+	tok, _ := p.Token(context.Background())
+	if tok != current {
+		t.Fatalf("token changed: %q -> %q", current, tok)
+	}
+}
+
+func TestHandleUnauthorizedNoRefreshAfterRejected(t *testing.T) {
+	t.Parallel()
+	as := newASFixture(t)
+	opener := newFakeOpener()
+	p := newChainProvider(t, opener, logging.Discard())
+	current := authorizeOnce(t, p, as, opener)
+	_, refreshBefore, _ := as.counters()
+	opensBefore := opener.calls.Load()
+
+	type result struct {
+		authorized bool
+		err        error
+	}
+	done := make(chan result, 1)
+	go func() {
+		a, err := p.HandleUnauthorized(context.Background(), as.wwwAuthenticate(), current, false)
+		done <- result{a, err}
+	}()
+	select {
+	case u := <-opener.openedURL:
+		runUserAgent(t, u)
+	case <-time.After(3 * time.Second):
+		t.Fatal("opener was not called with allowRefresh=false")
+	}
+	res := <-done
+	if res.err != nil || !res.authorized {
+		t.Fatalf("got (%v, %v), want (true, nil)", res.authorized, res.err)
+	}
+	if n := opener.calls.Load() - opensBefore; n != 1 {
+		t.Fatalf("opener called %d times, want 1", n)
+	}
+	if _, refreshAfter, _ := as.counters(); refreshAfter != refreshBefore {
+		t.Fatalf("refresh grant called %d times with allowRefresh=false", refreshAfter-refreshBefore)
+	}
+	tok, _ := p.Token(context.Background())
+	if tok == current || tok == "" {
+		t.Fatalf("token was not replaced by full flow: %q", tok)
+	}
+}
+
+// syncBuffer — потокобезопасный буфер для захвата slog-вывода.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Сценарий «протухший grant» на уровне провайдера: refresh проходит, выданный
+// токен отвергнут, следующий вызов идёт в браузер. Лог показывает оба шага и
+// не содержит значений токенов.
+func TestHandleUnauthorizedStaleGrantLogs(t *testing.T) {
+	t.Parallel()
+	as := newASFixture(t)
+	opener := newFakeOpener()
+	var logBuf syncBuffer
+	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p := newChainProvider(t, opener, log)
+
+	// secrets — все выданные access/refresh токены: ни один не должен попасть в лог.
+	var secrets []string
+	collectSecrets := func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.cachedTokens != nil {
+			secrets = append(secrets, p.cachedTokens.AccessToken, p.cachedTokens.RefreshToken)
+		}
+	}
+
+	first := authorizeOnce(t, p, as, opener)
+	collectSecrets()
+	authorized, err := p.HandleUnauthorized(context.Background(), as.wwwAuthenticate(), first, true)
+	if err != nil || authorized {
+		t.Fatalf("refresh step: got (%v, %v), want (false, nil)", authorized, err)
+	}
+	refreshed, _ := p.Token(context.Background())
+	if refreshed == first {
+		t.Fatal("refresh did not rotate token")
+	}
+	collectSecrets()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.HandleUnauthorized(context.Background(), as.wwwAuthenticate(), refreshed, false)
+		done <- err
+	}()
+	select {
+	case u := <-opener.openedURL:
+		runUserAgent(t, u)
+	case <-time.After(3 * time.Second):
+		t.Fatal("opener was not called after rejected refresh token")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("full flow: %v", err)
+	}
+	collectSecrets()
+
+	out := logBuf.String()
+	iRefresh := strings.Index(out, "token refreshed")
+	iRejected := strings.Index(out, "token rejected after refresh, starting full authorization")
+	if iRefresh < 0 || iRejected < 0 || iRefresh > iRejected {
+		t.Fatalf("expected 'token refreshed' before 'token rejected after refresh' in log:\n%s", out)
+	}
+	if len(secrets) != 6 {
+		t.Fatalf("collected %d token values, want 6", len(secrets))
+	}
+	for _, secret := range secrets {
+		if secret == "" || strings.Contains(out, secret) {
+			t.Fatalf("log contains token value %q:\n%s", secret, out)
+		}
+	}
+}
+
+// --- callback-порт и повторная регистрация клиента -------------------------
+
+// reauthEnv — провайдер с захватом debug-лога для сценариев повторной
+// авторизации.
+type reauthEnv struct {
+	as     *asFixture
+	opener *fakeOpener
+	log    *syncBuffer
+	p      *Provider
+}
+
+func newReauthEnv(t *testing.T, mutate func(as *asFixture, cfg *config.Config)) *reauthEnv {
+	t.Helper()
+	e := &reauthEnv{as: newASFixture(t), opener: newFakeOpener(), log: &syncBuffer{}}
+	cfg := &config.Config{
+		ServerURL:   "https://mcp.example/server",
+		AllowHTTP:   true,
+		ConfigDir:   t.TempDir(),
+		AuthTimeout: 5 * time.Second,
+	}
+	if mutate != nil {
+		mutate(e.as, cfg)
+	}
+	log := slog.New(slog.NewTextHandler(e.log, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	e.p = New(cfg, e.opener, log)
+	return e
+}
+
+func (e *reauthEnv) saveClient(t *testing.T, ci *ClientInfo) {
+	t.Helper()
+	if err := e.p.storage.SaveClient(ci); err != nil {
+		t.Fatalf("SaveClient: %v", err)
+	}
+}
+
+// authorize проводит полный флоу и возвращает параметры URL авторизации.
+func (e *reauthEnv) authorize(t *testing.T) url.Values {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- handleUnauthorized(e.p, e.as.wwwAuthenticate()) }()
+	var opened string
+	select {
+	case opened = <-e.opener.openedURL:
+		runUserAgent(t, opened)
+	case <-time.After(3 * time.Second):
+		t.Fatal("opener was not called")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("authorize: %v\nlog:\n%s", err, e.log.String())
+	}
+	u, err := url.Parse(opened)
+	if err != nil {
+		t.Fatalf("parse auth URL: %v", err)
+	}
+	return u.Query()
+}
+
+func callbackFor(port int) string {
+	return "http://127.0.0.1:" + strconv.Itoa(port) + "/callback"
+}
+
+func TestReauthUsesRegisteredPort(t *testing.T) {
+	t.Parallel()
+	e := newReauthEnv(t, nil)
+	saved := callbackFor(freePort(t))
+	e.saveClient(t, &ClientInfo{ClientID: "saved", RedirectURIs: []string{saved}})
+
+	q := e.authorize(t)
+	if q.Get("redirect_uri") != saved || q.Get("client_id") != "saved" {
+		t.Fatalf("redirect_uri=%q client_id=%q, want %q/saved", q.Get("redirect_uri"), q.Get("client_id"), saved)
+	}
+	if _, _, dcr := e.as.counters(); dcr != 0 {
+		t.Fatalf("/register called %d times, want 0", dcr)
+	}
+}
+
+func TestReauthBusyPortReregisters(t *testing.T) {
+	t.Parallel()
+	e := newReauthEnv(t, nil)
+	busy := callbackFor(holdPort(t))
+	e.saveClient(t, &ClientInfo{ClientID: "saved", RedirectURIs: []string{busy}})
+
+	q := e.authorize(t)
+	if _, _, dcr := e.as.counters(); dcr != 1 {
+		t.Fatalf("/register called %d times, want 1", dcr)
+	}
+	stored, err := e.p.storage.LoadClient()
+	if err != nil {
+		t.Fatalf("LoadClient: %v", err)
+	}
+	if stored.ClientID == "saved" || q.Get("client_id") != stored.ClientID {
+		t.Fatalf("client_id: url=%q stored=%q, want new registration", q.Get("client_id"), stored.ClientID)
+	}
+	if q.Get("redirect_uri") == busy || !slices.Contains(stored.RedirectURIs, q.Get("redirect_uri")) {
+		t.Fatalf("redirect_uri=%q, stored=%v", q.Get("redirect_uri"), stored.RedirectURIs)
+	}
+	if out := e.log.String(); !strings.Contains(out, "re-registering client") || !strings.Contains(out, "reason=port_unavailable") {
+		t.Fatalf("log has no re-registration with reason:\n%s", out)
+	}
+}
+
+func TestReauthClientWithoutRedirectURIsReregisters(t *testing.T) {
+	t.Parallel()
+	e := newReauthEnv(t, nil)
+	e.saveClient(t, &ClientInfo{ClientID: "saved"})
+
+	q := e.authorize(t)
+	if _, _, dcr := e.as.counters(); dcr != 1 {
+		t.Fatalf("/register called %d times, want 1", dcr)
+	}
+	stored, _ := e.p.storage.LoadClient()
+	if stored == nil || !slices.Contains(stored.RedirectURIs, q.Get("redirect_uri")) {
+		t.Fatalf("stored client = %+v, want redirect_uris with %q", stored, q.Get("redirect_uri"))
+	}
+	if out := e.log.String(); !strings.Contains(out, "reason=no_redirect_uris") {
+		t.Fatalf("log has no reason=no_redirect_uris:\n%s", out)
+	}
+}
+
+func TestReauthStaticClientNeverRegisters(t *testing.T) {
+	t.Parallel()
+	busy := callbackFor(holdPort(t))
+	e := newReauthEnv(t, func(as *asFixture, cfg *config.Config) {
+		as.denyRegister = true
+		cfg.StaticOAuthClientInfoJSON, _ = json.Marshal(map[string]any{
+			"client_id":     "static-1",
+			"redirect_uris": []string{busy},
+		})
+	})
+
+	q := e.authorize(t)
+	if _, _, dcr := e.as.counters(); dcr != 0 {
+		t.Fatalf("/register called %d times, want 0", dcr)
+	}
+	if q.Get("client_id") != "static-1" || q.Get("redirect_uri") == busy {
+		t.Fatalf("client_id=%q redirect_uri=%q", q.Get("client_id"), q.Get("redirect_uri"))
+	}
+	out := e.log.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "callback_url="+q.Get("redirect_uri")) {
+		t.Fatalf("log has no warn with callback URL:\n%s", out)
+	}
+}
+
+func TestReauthNoRegistrationEndpointWarns(t *testing.T) {
+	t.Parallel()
+	e := newReauthEnv(t, func(as *asFixture, _ *config.Config) { as.skipDCRSupport = true })
+	e.saveClient(t, &ClientInfo{ClientID: "saved", RedirectURIs: []string{callbackFor(holdPort(t))}})
+
+	q := e.authorize(t)
+	if q.Get("client_id") != "saved" {
+		t.Fatalf("client_id=%q, want saved", q.Get("client_id"))
+	}
+	if _, _, dcr := e.as.counters(); dcr != 0 {
+		t.Fatalf("/register called %d times, want 0", dcr)
+	}
+	if out := e.log.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "no registration_endpoint") {
+		t.Fatalf("log has no warn:\n%s", out)
+	}
+	if tok, _ := e.p.Token(context.Background()); tok == "" {
+		t.Fatal("flow did not issue a token")
+	}
+}
+
+func TestDCRResponseWithoutRedirectURIsKeepsSent(t *testing.T) {
+	t.Parallel()
+	e := newReauthEnv(t, func(as *asFixture, _ *config.Config) { as.omitDCRRedirectURIs = true })
+
+	q := e.authorize(t)
+	stored, err := e.p.storage.LoadClient()
+	if err != nil {
+		t.Fatalf("LoadClient: %v", err)
+	}
+	if len(stored.RedirectURIs) != 1 || stored.RedirectURIs[0] != q.Get("redirect_uri") {
+		t.Fatalf("stored redirect_uris = %v, want [%s]", stored.RedirectURIs, q.Get("redirect_uri"))
+	}
+	if _, _, dcr := e.as.counters(); dcr != 1 {
+		t.Fatalf("/register called %d times, want 1", dcr)
+	}
+}
+
+// Сценарий «Параллельные запросы с одним протухшим токеном»: два 401 на один
+// и тот же токен обрабатываются одновременно — refresh выполняется один раз,
+// второй вызов видит уже заменённый токен.
+func TestHandleUnauthorizedConcurrentSameTokenRefreshesOnce(t *testing.T) {
+	t.Parallel()
+	as := newASFixture(t)
+	opener := newFakeOpener()
+	p := newChainProvider(t, opener, logging.Discard())
+	stale := authorizeOnce(t, p, as, opener)
+	_, refreshBefore, _ := as.counters()
+	opensBefore := opener.calls.Load()
+
+	type result struct {
+		authorized bool
+		err        error
+	}
+	const n = 2
+	start := make(chan struct{})
+	results := make(chan result, n)
+	for range n {
+		go func() {
+			<-start
+			a, err := p.HandleUnauthorized(context.Background(), as.wwwAuthenticate(), stale, true)
+			results <- result{a, err}
+		}()
+	}
+	close(start)
+	for range n {
+		select {
+		case r := <-results:
+			if r.err != nil || r.authorized {
+				t.Fatalf("got (%v, %v), want (false, nil)", r.authorized, r.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("HandleUnauthorized hung")
+		}
+	}
+	if _, refreshAfter, _ := as.counters(); refreshAfter-refreshBefore != 1 {
+		t.Fatalf("refresh grants = %d, want 1", refreshAfter-refreshBefore)
+	}
+	if n := opener.calls.Load() - opensBefore; n != 0 {
+		t.Fatalf("opener called %d times, want 0", n)
+	}
+	if tok, _ := p.Token(context.Background()); tok == stale || tok == "" {
+		t.Fatalf("token was not replaced: %q", tok)
+	}
+}
+
+// Явный порт перекрывает порт сохранённого клиента; DCR-клиент
+// регистрируется заново с reason=explicit_port.
+func TestReauthExplicitPortReregisters(t *testing.T) {
+	t.Parallel()
+	savedPort, explicitPort := freePort(t), freePort(t)
+	e := newReauthEnv(t, func(_ *asFixture, cfg *config.Config) { cfg.Port = explicitPort })
+	e.saveClient(t, &ClientInfo{ClientID: "saved", RedirectURIs: []string{callbackFor(savedPort)}})
+
+	q := e.authorize(t)
+	if got, want := q.Get("redirect_uri"), callbackFor(explicitPort); got != want {
+		t.Fatalf("redirect_uri=%q, want %q", got, want)
+	}
+	if _, _, dcr := e.as.counters(); dcr != 1 {
+		t.Fatalf("/register called %d times, want 1", dcr)
+	}
+	stored, err := e.p.storage.LoadClient()
+	if err != nil {
+		t.Fatalf("LoadClient: %v", err)
+	}
+	if stored.ClientID == "saved" || q.Get("client_id") != stored.ClientID {
+		t.Fatalf("client_id: url=%q stored=%q, want new registration", q.Get("client_id"), stored.ClientID)
+	}
+	if out := e.log.String(); !strings.Contains(out, "reason=explicit_port") {
+		t.Fatalf("log has no reason=explicit_port:\n%s", out)
+	}
 }

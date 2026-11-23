@@ -15,11 +15,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/dezer32/mcp-remote/internal/config"
+	"github.com/dezer32/mcp-remote/internal/wwwauth"
 )
 
 // Opener абстрагирует открытие URL в браузере (для тестов).
@@ -60,6 +63,9 @@ type Provider struct {
 	cachedMeta     *AuthServerMetadata
 	cachedResource string
 	loaded         bool // tokens/meta/client уже подтянуты с диска
+	// clientStatic — cachedClient задан --static-oauth-client-info: такой
+	// клиент не регистрируется заново.
+	clientStatic bool
 }
 
 // New создаёт Provider. Файлы с диска не читаются здесь — lazy.
@@ -92,6 +98,7 @@ func New(cfg *config.Config, opener Opener, log *slog.Logger) *Provider {
 			p.log.Warn("oauth: parse StaticOAuthClientInfoJSON", slog.String("error", err.Error()))
 		} else {
 			p.cachedClient = &ci
+			p.clientStatic = true
 		}
 	}
 
@@ -159,28 +166,43 @@ func (p *Provider) Token(ctx context.Context) (string, error) {
 	return p.cachedTokens.AccessToken, nil
 }
 
-// HandleUnauthorized обрабатывает 401: парсит challenge, делает refresh либо
-// полный authorize flow. После успеха Token вернёт новый access-токен.
-func (p *Provider) HandleUnauthorized(ctx context.Context, wwwAuthenticate string) error {
+// HandleUnauthorized обрабатывает 401 на запрос, ушедший с rejectedToken
+// ("" — токен провайдера не отправлялся). Реализует httpmcp.TokenProvider.
+// Под p.mu, в порядке проверки:
+//   - текущий токен есть и отличается от rejectedToken — его уже заменил
+//     другой запрос: (false, nil) без сетевых вызовов, httpmcp повторит запрос;
+//   - allowRefresh и есть refresh_token — refresh; на успех (false, nil),
+//     на провал токены чистятся и выполняется полный флоу;
+//   - !allowRefresh — токен, выданный предыдущим шагом цепочки, отвергнут:
+//     токены чистятся без refresh и выполняется полный флоу;
+//   - полный флоу в браузере — (true, err).
+func (p *Provider) HandleUnauthorized(ctx context.Context, wwwAuthenticate, rejectedToken string, allowRefresh bool) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if err := p.ensureLoadedLocked(); err != nil {
-		return err
+		return false, err
 	}
 
-	// Сначала пытаемся refresh, если есть refresh_token, который мы ещё не
-	// "поломали" в этом вызове.
-	if p.cachedTokens != nil && p.cachedTokens.RefreshToken != "" {
+	if p.cachedTokens != nil && p.cachedTokens.AccessToken != "" && p.cachedTokens.AccessToken != rejectedToken {
+		p.log.Debug("oauth: token already replaced, retrying")
+		return false, nil
+	}
+
+	switch {
+	case allowRefresh && p.cachedTokens != nil && p.cachedTokens.RefreshToken != "":
 		if err := p.refreshTokensLocked(ctx); err == nil {
-			return nil
+			return false, nil
 		} else {
 			p.log.Info("oauth: refresh failed, falling back to full authorize", slog.String("error", err.Error()))
 			p.clearTokensLocked()
 		}
+	case !allowRefresh && p.cachedTokens != nil:
+		p.log.Info("oauth: token rejected after refresh, starting full authorization")
+		p.clearTokensLocked()
 	}
 
-	return p.authorizeLocked(ctx, wwwAuthenticate)
+	return true, p.authorizeLocked(ctx, wwwAuthenticate)
 }
 
 // authorizeLocked — полный authorization_code flow + PKCE + DCR.
@@ -192,7 +214,7 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 
 	// 1) Парсим challenge.
 	var resourceMetadataURL string
-	if params := parseWWWAuthenticate(wwwAuthenticate); params != nil {
+	if params := wwwauth.ParseBearer(wwwAuthenticate); params != nil {
 		resourceMetadataURL = params["resource_metadata"]
 	}
 
@@ -226,7 +248,13 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 		return fmt.Errorf("oauth: state: %w", err)
 	}
 
-	callbackURL, srv, err := listenCallback(p.cfg, state)
+	// Порт callback: сначала тот, на который зарегистрирован известный клиент
+	// (строгий AS сверяет redirect_uri с зарегистрированными).
+	preferredPort := 0
+	if p.cachedClient != nil {
+		preferredPort = registeredCallbackPort(p.cfg.Host, p.cachedClient.RedirectURIs)
+	}
+	callbackURL, srv, err := listenCallback(p.cfg, state, preferredPort, p.log)
 	if err != nil {
 		return fmt.Errorf("oauth: callback listener: %w", err)
 	}
@@ -240,19 +268,10 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 			slog.String("host", p.cfg.Host))
 	}
 
-	// 4) DCR (если cachedClient ещё пуст и есть registration endpoint).
-	if p.cachedClient == nil && meta.RegistrationEndpoint != "" {
-		var client *ClientInfo
-		client, err = p.registerClient(ctx, meta.RegistrationEndpoint, callbackURL)
-		if err != nil {
-			return fmt.Errorf("oauth: dynamic client registration: %w", err)
-		}
-		p.cachedClient = client
-		if p.storage != nil {
-			if saveErr := p.storage.SaveClient(client); saveErr != nil {
-				p.log.Warn("oauth: save client", slog.String("error", saveErr.Error()))
-			}
-		}
+	// 4) DCR: новый клиент либо повторная регистрация, если callbackURL не
+	//    входит в redirect_uris известного клиента.
+	if err = p.ensureClientLocked(ctx, meta, callbackURL, preferredPort); err != nil {
+		return err
 	}
 	if p.cachedClient == nil || p.cachedClient.ClientID == "" {
 		return errors.New("oauth: no DCR endpoint and no static client")
@@ -300,6 +319,75 @@ func (p *Provider) authorizeLocked(ctx context.Context, wwwAuthenticate string) 
 	return nil
 }
 
+// ensureClientLocked гарантирует, что для callbackURL есть клиент, у которого
+// он входит в redirect_uris (точное совпадение строки — так сравнивают строгие
+// AS). DCR выполняется не больше одного раза за флоу:
+//   - клиента нет и есть registration_endpoint — первичная регистрация;
+//   - callbackURL уже зарегистрирован — ничего не делаем;
+//   - статический клиент (--static-oauth-client-info) не регистрируется:
+//     при непустом несовпадающем redirect_uris — warn с подсказкой про port;
+//   - клиент из DCR без registration_endpoint — warn, продолжаем с ним;
+//   - иначе повторная регистрация с info-логом и причиной.
+//
+// Если и после регистрации callbackURL не входит в redirect_uris
+// (пользовательские metadata со своим списком) — warn, флоу продолжается.
+// Должен вызываться под p.mu.
+func (p *Provider) ensureClientLocked(ctx context.Context, meta *AuthServerMetadata, callbackURL string, preferredPort int) error {
+	c := p.cachedClient
+	switch {
+	case c == nil:
+		if meta.RegistrationEndpoint == "" {
+			return nil // ошибку «нет клиента» вернёт caller
+		}
+	case slices.Contains(c.RedirectURIs, callbackURL):
+		return nil
+	case p.clientStatic:
+		if len(c.RedirectURIs) > 0 {
+			p.log.Warn("oauth: callback URL is not among redirect_uris of the static OAuth client; authorization may fail. Pass the registered port as the positional port argument",
+				slog.String("callback_url", callbackURL))
+		}
+		return nil
+	case meta.RegistrationEndpoint == "":
+		p.log.Warn("oauth: callback URL is not among redirect_uris of the registered client, and the authorization server has no registration_endpoint; authorization may fail",
+			slog.String("callback_url", callbackURL))
+		return nil
+	default:
+		p.log.Info("oauth: re-registering client",
+			slog.String("reason", p.reregisterReason(c, callbackURL, preferredPort)),
+			slog.String("callback_url", callbackURL))
+	}
+
+	client, err := p.registerClient(ctx, meta.RegistrationEndpoint, callbackURL)
+	if err != nil {
+		return fmt.Errorf("oauth: dynamic client registration: %w", err)
+	}
+	p.cachedClient = client
+	if p.storage != nil {
+		if saveErr := p.storage.SaveClient(client); saveErr != nil {
+			p.log.Warn("oauth: save client", slog.String("error", saveErr.Error()))
+		}
+	}
+	if !slices.Contains(client.RedirectURIs, callbackURL) {
+		p.log.Warn("oauth: registered client redirect_uris do not include the callback URL; authorization may fail",
+			slog.String("callback_url", callbackURL))
+	}
+	return nil
+}
+
+// reregisterReason — причина повторной регистрации для лога.
+func (p *Provider) reregisterReason(c *ClientInfo, callbackURL string, preferredPort int) string {
+	switch {
+	case len(c.RedirectURIs) == 0:
+		return "no_redirect_uris"
+	case p.cfg != nil && p.cfg.Port > 0:
+		return "explicit_port"
+	case preferredPort > 0 && !strings.HasSuffix(callbackURL, ":"+strconv.Itoa(preferredPort)+callbackPath):
+		return "port_unavailable"
+	default:
+		return "mismatch"
+	}
+}
+
 // registerClient выполняет RFC 7591 Dynamic Client Registration.
 func (p *Provider) registerClient(ctx context.Context, regEndpoint, callbackURL string) (*ClientInfo, error) {
 	if _, err := validateEndpointURL(regEndpoint, p.allowHTTP()); err != nil {
@@ -334,6 +422,17 @@ func (p *Provider) registerClient(ctx context.Context, regEndpoint, callbackURL 
 	}
 	if ci.ClientID == "" {
 		return nil, errors.New("register response without client_id")
+	}
+	if len(ci.RedirectURIs) == 0 {
+		// RFC 7591 §3.2.1: сервер возвращает зарегистрированные metadata;
+		// отсутствие поля считаем принятием отправленного списка. Иначе
+		// следующая авторизация снова уйдёт в DCR.
+		var sent struct {
+			RedirectURIs []string `json:"redirect_uris"`
+		}
+		if json.Unmarshal(body, &sent) == nil {
+			ci.RedirectURIs = sent.RedirectURIs
+		}
 	}
 	return &ci, nil
 }
@@ -480,6 +579,7 @@ func (p *Provider) refreshTokensLocked(ctx context.Context) error {
 			p.log.Warn("oauth: save tokens after refresh", slog.String("error", err.Error()))
 		}
 	}
+	p.log.Debug("oauth: token refreshed")
 	return nil
 }
 

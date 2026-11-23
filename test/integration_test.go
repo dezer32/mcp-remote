@@ -8,16 +8,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dezer32/mcp-remote/internal/oauth"
 )
 
 const (
@@ -113,7 +117,26 @@ func (w *testLogWriter) Write(p []byte) (int, error) {
 type proxyHandle struct {
 	stdin  io.WriteCloser
 	stdout *bufio.Scanner
+	stderr *lockedBuffer // копия stderr для проверок лога
 	kill   func()
+}
+
+// lockedBuffer — потокобезопасный буфер.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // startProxy запускает бинарь mcp-remote с указанными args/env. stderr идёт
@@ -122,7 +145,8 @@ func startProxy(t *testing.T, bin string, args []string, env []string) *proxyHan
 	t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Stderr = newTestLogWriter(t, "[proxy] ")
+	stderr := &lockedBuffer{}
+	cmd.Stderr = io.MultiWriter(newTestLogWriter(t, "[proxy] "), stderr)
 
 	wIn, err := cmd.StdinPipe()
 	if err != nil {
@@ -165,6 +189,7 @@ func startProxy(t *testing.T, bin string, args []string, env []string) *proxyHan
 	return &proxyHandle{
 		stdin:  wIn,
 		stdout: sc,
+		stderr: stderr,
 		kill:   kill,
 	}
 }
@@ -528,4 +553,184 @@ func hasTokensFile(root string) bool {
 		return nil
 	})
 	return found
+}
+
+// TestIntegration_OAuthStaleGrant — «протухший grant»: в хранилище истёкший
+// access и рабочий refresh_token, но ресурс отвергает любые токены, выданные
+// refresh-ем. Прокси не должен упереться в refresh: после отказа он сам
+// проходит полный флоу (browser_helper), и initialize возвращает result.
+func TestIntegration_OAuthStaleGrant(t *testing.T) {
+	bin := buildBinary(t)
+	helper := buildBrowserHelper(t)
+
+	srv := NewFakeOAuthServer(t)
+	defer srv.Close()
+	srv.SetRejectRefreshedTokens(true)
+
+	serverURL := srv.URL + "/mcp"
+	cfgDir := t.TempDir()
+	st, err := oauth.NewStorage(cfgDir, serverURL)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	callback := "http://127.0.0.1:" + strconv.Itoa(freeTCPPort(t)) + "/callback"
+	srv.RegisterClient("stale-client", []string{callback})
+	if err := st.SaveClient(&oauth.ClientInfo{ClientID: "stale-client", RedirectURIs: []string{callback}, TokenEndpointAuthMethod: "none"}); err != nil {
+		t.Fatalf("SaveClient: %v", err)
+	}
+	if err := st.SaveMetadata(&oauth.AuthServerMetadata{
+		Issuer:                srv.URL,
+		AuthorizationEndpoint: srv.URL + "/authorize",
+		TokenEndpoint:         srv.URL + "/token",
+		RegistrationEndpoint:  srv.URL + "/register",
+	}, serverURL); err != nil {
+		t.Fatalf("SaveMetadata: %v", err)
+	}
+	if err := st.SaveTokens(&oauth.Tokens{
+		AccessToken:  "expired-access",
+		RefreshToken: "stale-refresh",
+		TokenType:    "Bearer",
+		ExpiresAt:    time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveTokens: %v", err)
+	}
+
+	h := startProxy(t, bin,
+		[]string{"--allow-http", "--debug", serverURL},
+		[]string{
+			"BROWSER=" + helper,
+			"MCP_REMOTE_CONFIG_DIR=" + cfgDir,
+			"HOME=" + t.TempDir(),
+		},
+	)
+
+	sendJSON(t, h.stdin, initializeRequest(1))
+	resp := readJSONByID(t, h.stdout, 1, 30*time.Second)
+	res := resultMap(t, resp)
+	if pv, _ := res["protocolVersion"].(string); pv != "2025-03-26" {
+		t.Fatalf("initialize: protocolVersion = %q, want 2025-03-26", pv)
+	}
+
+	// До браузера было два refresh: истёкший токен в Token() и первый 401.
+	if n := srv.RefreshGrantCount(); n < 2 {
+		t.Fatalf("refresh grants = %d, want >= 2", n)
+	}
+	log := h.stderr.String()
+	iRefreshed := strings.Index(log, "token refreshed")
+	iRejected := strings.Index(log, "token rejected after refresh, starting full authorization")
+	if iRefreshed < 0 || iRejected < 0 || iRefreshed > iRejected {
+		t.Fatalf("log must contain 'token refreshed' before 'token rejected after refresh':\n%s", log)
+	}
+	if !strings.Contains(log, "remote 401") || !strings.Contains(log, "error=invalid_token") {
+		t.Fatalf("log has no 'remote 401' with error=invalid_token:\n%s", log)
+	}
+	for _, secret := range []string{"refreshed-token-", "stale-refresh", "expired-access"} {
+		if strings.Contains(log, secret) {
+			t.Fatalf("log contains token value %q", secret)
+		}
+	}
+}
+
+// TestIntegration_OAuthReusesRegisteredPort — повторная авторизация на
+// строгом сервере: второй запуск после удаления tokens.json поднимает
+// callback на зарегистрированном порту, и новая регистрация не нужна.
+func TestIntegration_OAuthReusesRegisteredPort(t *testing.T) {
+	bin := buildBinary(t)
+	helper := buildBrowserHelper(t)
+
+	srv := NewFakeOAuthServer(t)
+	defer srv.Close()
+	srv.SetStrictRedirectURI(true)
+
+	cfgDir := t.TempDir()
+	home := t.TempDir()
+	run := func(name string) {
+		t.Helper()
+		h := startProxy(t, bin,
+			[]string{"--allow-http", "--auth-timeout", "20s", srv.URL + "/mcp"},
+			[]string{
+				"BROWSER=" + helper,
+				"MCP_REMOTE_CONFIG_DIR=" + cfgDir,
+				"HOME=" + home,
+			},
+		)
+		sendJSON(t, h.stdin, initializeRequest(1))
+		resp := readJSONByID(t, h.stdout, 1, 30*time.Second)
+		if _, ok := resp["result"]; !ok {
+			t.Fatalf("%s: initialize = %v", name, resp)
+		}
+		h.kill()
+	}
+
+	run("first run")
+	if n := srv.RegistrationCount(); n != 1 {
+		t.Fatalf("registrations after first run = %d, want 1", n)
+	}
+	srv.GrantToken("") // ресурс снова требует авторизацию
+	removed := 0
+	_ = filepath.WalkDir(cfgDir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "tokens.json" {
+			if os.Remove(path) == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	if removed != 1 {
+		t.Fatalf("removed %d tokens.json files, want 1", removed)
+	}
+
+	run("second run")
+	if n := srv.RegistrationCount(); n != 1 {
+		t.Fatalf("registrations after second run = %d, want 1", n)
+	}
+}
+
+// TestIntegration_OAuthTokenRejectedAfterAuthorization — ресурс отвергает
+// любой токен, сохранённых токенов нет: браузер открывается ровно один раз, а
+// клиент получает JSON-RPC ошибку с кодом ошибки сервера (invalid_token).
+func TestIntegration_OAuthTokenRejectedAfterAuthorization(t *testing.T) {
+	bin := buildBinary(t)
+	helper := buildBrowserHelper(t)
+
+	srv := NewFakeOAuthServer(t)
+	defer srv.Close()
+	srv.SetRejectAllTokens(true)
+
+	h := startProxy(t, bin,
+		[]string{"--allow-http", srv.URL + "/mcp"},
+		[]string{
+			"BROWSER=" + helper,
+			"MCP_REMOTE_CONFIG_DIR=" + t.TempDir(),
+			"HOME=" + t.TempDir(),
+		},
+	)
+
+	sendJSON(t, h.stdin, initializeRequest(1))
+	resp := readJSONByID(t, h.stdout, 1, 30*time.Second)
+	if _, ok := resp["result"]; ok {
+		t.Fatalf("initialize: got result, want error: %v", resp)
+	}
+	errObj, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("initialize: no error object: %v", resp)
+	}
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "token rejected right after authorization") || !strings.Contains(msg, "invalid_token") {
+		t.Fatalf("error message = %q, want 'token rejected right after authorization' and 'invalid_token'", msg)
+	}
+	if n := srv.AuthorizeCount(); n != 1 {
+		t.Fatalf("authorize hits = %d, want 1 (browser opened exactly once)", n)
+	}
+}
+
+// freeTCPPort возвращает порт, который только что был свободен на 127.0.0.1.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
 }

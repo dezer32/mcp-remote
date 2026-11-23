@@ -1,8 +1,9 @@
 package oauth
 
 // Локальный OAuth callback listener.
-//   net.Listen("tcp", host:0) → http.Server на /callback.
-//   host из cfg.Host (default 127.0.0.1).
+//   net.Listen("tcp", host:port) → http.Server на /callback.
+//   host из cfg.Host (default 127.0.0.1). port: явный cfg.Port, иначе порт
+//   из redirect_uris известного клиента (с fallback на случайный), иначе 0.
 //   Принимает ?code=...&state=... либо ?error=...&error_description=...
 //   state валидируется (в постоянное время) для code и для error; запрос с
 //   неверным/отсутствующим state получает 400 и ожидание не завершает.
@@ -15,9 +16,12 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,22 +53,48 @@ type callbackServer struct {
 	once sync.Once // защищает result от двойной отправки
 }
 
-// listenCallback стартует HTTP сервер на cfg.Host (default 127.0.0.1) на
-// случайном порту. expectedState — для валидации state в callback.
+// listenCallback стартует HTTP сервер на cfg.Host (default 127.0.0.1).
+// Порт выбирается так:
+//  1. cfg.Port > 0 — явный порт; ошибка bind фатальна;
+//  2. preferredPort > 0 — порт из redirect_uris известного клиента; если
+//     bind не удался, пишется debug-лог и берётся случайный порт;
+//  3. иначе случайный порт (0).
+//
+// expectedState — для валидации state в callback. log может быть nil.
 // Возвращает абсолютный callback URL и сам сервер.
-func listenCallback(cfg *config.Config, expectedState string) (string, *callbackServer, error) {
+func listenCallback(cfg *config.Config, expectedState string, preferredPort int, log *slog.Logger) (string, *callbackServer, error) {
 	host := defaultHost
 	if cfg != nil && cfg.Host != "" {
 		host = cfg.Host
 	}
-	port := 0
-	if cfg != nil && cfg.Port > 0 {
-		port = cfg.Port
+	// IPv6 в cfg.Host допустим и в скобках, и без: JoinHostPort ставит их сам.
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	explicit := cfg != nil && cfg.Port > 0
+
+	var ln net.Listener
+	var err error
+	switch {
+	case explicit:
+		addr := net.JoinHostPort(host, strconv.Itoa(cfg.Port))
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			return "", nil, fmt.Errorf("oauth: listen %s: %w", addr, err)
+		}
+	case preferredPort > 0:
+		addr := net.JoinHostPort(host, strconv.Itoa(preferredPort))
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
+			if log != nil {
+				log.Debug("oauth: registered callback port unavailable, using a random port",
+					slog.Int("port", preferredPort), slog.String("error", err.Error()))
+			}
+			ln = nil
+		}
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return "", nil, fmt.Errorf("oauth: listen %s: %w", addr, err)
+	if ln == nil {
+		addr := net.JoinHostPort(host, "0")
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			return "", nil, fmt.Errorf("oauth: listen %s: %w", addr, err)
+		}
 	}
 
 	cs := &callbackServer{
@@ -96,8 +126,35 @@ func listenCallback(cfg *config.Config, expectedState string) (string, *callback
 		// IPv6 — оборачиваем в квадратные скобки.
 		hostPart = "[" + hostPart + "]"
 	}
-	url := fmt.Sprintf("http://%s:%d%s", hostPart, tcpAddr.Port, callbackPath)
-	return url, cs, nil
+	callbackURL := fmt.Sprintf("http://%s:%d%s", hostPart, tcpAddr.Port, callbackPath)
+	return callbackURL, cs, nil
+}
+
+// registeredCallbackPort возвращает порт первого URL из redirectURIs, на
+// котором может подняться callback-сервер на host: схема http, тот же хост
+// (без учёта регистра, IPv6 без скобок), путь /callback и числовой порт.
+// 0 — подходящего URL нет. Пустой host — defaultHost. "localhost" и
+// "127.0.0.1" — разные хосты: строгий AS сравнивает redirect_uri как строку.
+func registeredCallbackPort(host string, redirectURIs []string) int {
+	if host == "" {
+		host = defaultHost
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	for _, raw := range redirectURIs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "http" || u.Path != callbackPath {
+			continue
+		}
+		if !strings.EqualFold(u.Hostname(), host) {
+			continue
+		}
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		return port
+	}
+	return 0
 }
 
 // isLoopbackHost сообщает, слушает ли callback-сервер только loopback:

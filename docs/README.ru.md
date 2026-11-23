@@ -126,8 +126,14 @@ mcp-remote <server-url> [port] [flags]
 | `--config-dir` | `<path>` | Корень хранения токенов и OAuth-метаданных. |
 
 Позиционные аргументы: первый — обязательный URL remote MCP-сервера,
-второй (опционально) — желаемый порт локального callback-сервера; если
-не задан или `0`, порт выбирает ОС.
+второй (опционально) — порт локального OAuth callback-сервера. Если он
+не задан или `0`, mcp-remote берёт порт из `redirect_uris` сохранённого
+клиента (или клиента из `--static-oauth-client-info`), чтобы
+`redirect_uri` остался тем, который знает сервер авторизации. Если этот
+порт занят другим процессом, порт выбирает ОС, а клиент, полученный
+динамической регистрацией, регистрируется заново с новым callback URL.
+Явно заданный порт всегда в приоритете; если он занят, авторизация
+завершается ошибкой.
 
 ## Переменные окружения
 
@@ -144,13 +150,26 @@ mcp-remote <server-url> [port] [flags]
 1. Парсит `WWW-Authenticate` и/или выполняет RFC9728 protected-resource
    discovery, чтобы найти Authorization Server.
 2. Делает RFC8414 metadata discovery у Authorization Server.
-3. Если нужно — выполняет RFC7591 Dynamic Client Registration (или
-   использует данные из `--static-oauth-client-info`).
-4. Поднимает локальный HTTP-сервер на `--host:port` для приёма callback.
+3. Поднимает локальный HTTP-сервер на `--host:port` для приёма callback.
+   Без явного порта берёт порт из `redirect_uris` известного клиента
+   (если он занят — случайный порт).
+4. Если нужно — выполняет RFC7591 Dynamic Client Registration (или
+   использует данные из `--static-oauth-client-info`). Клиент из
+   динамической регистрации, в `redirect_uris` которого нет текущего
+   callback URL, регистрируется заново до открытия браузера (не больше
+   одного раза за флоу).
 5. Открывает браузер пользователя на authorization endpoint
    (PKCE S256, state, redirect_uri = `http://<host>:<port>/callback`).
 6. После успешного редиректа обменивает `code` на access/refresh токены.
 7. Сохраняет токены, client info и server metadata в config-dir.
+
+На следующий `401` mcp-remote сначала пробует сохранённый
+`refresh_token`. Если remote отвергает и обновлённый токен, mcp-remote
+удаляет токены и запускает полный флоу в браузере; если отвергнут и
+токен из браузерного флоу, запрос завершается ошибкой
+`http 401: token rejected right after authorization: <error>: <description>`
+без повторного открытия браузера. Один запрос повторяется после `401`
+не больше трёх раз.
 
 ### Где хранятся токены
 
@@ -198,6 +217,22 @@ Remove-Item -Recurse -Force "$env:AppData\mcp-remote\<hash16>"
 - **Сервер не поддерживает DCR** — зарегистрируйте клиент вручную и
   передайте `--static-oauth-client-info '{"client_id":"...","client_secret":"..."}'`
   (или `@/path/to/file.json`).
+- **`The specified 'redirect_uri' is not valid for this client application`**
+  (или другой `invalid_request` про `redirect_uri` на странице
+  авторизации) — порт callback не совпадает с тем, на который
+  зарегистрирован клиент. mcp-remote использует зарегистрированный порт,
+  а если не может — регистрирует клиента заново; запустите с `--debug` и
+  ищите `re-registering client` и его `reason`. Клиента из
+  `--static-oauth-client-info` зарегистрировать заново нельзя: передайте
+  зарегистрированный порт вторым позиционным аргументом
+  (`mcp-remote https://example.com/mcp 62505`).
+- **`401` сразу после refresh токена** — сервер авторизации выдаёт
+  токены, которые ресурс уже не принимает (например, протух grant).
+  mcp-remote в этом случае сам открывает браузер. Чтобы увидеть, почему
+  ресурс отвергает токен, запустите
+  `mcp-remote https://example.com/mcp --debug 2>&1 | grep -E 'remote 401|token refreshed|token rejected|re-registering'`
+  и смотрите `error=` / `error_description=` и `token_sent=` в записях
+  `remote 401`.
 - **Сброс залипшего state** — удалите директорию с токенами для этого
   сервера (см. выше) и перезапустите клиент.
 - **HTTP вместо HTTPS** — в dev-окружении добавьте `--allow-http`. В
@@ -244,6 +279,7 @@ Remove-Item -Recurse -Force "$env:AppData\mcp-remote\<hash16>"
 | `internal/config`  | CLI-флаги, env vars, валидация |
 | `internal/stdio`   | Транспорт stdin/stdout |
 | `internal/httpmcp` | Streamable HTTP клиент к remote MCP |
+| `internal/wwwauth` | Разбор `WWW-Authenticate` (Bearer) |
 | `internal/oauth`   | OAuth 2.1 (PKCE + RFC7591 DCR + RFC9728/RFC8414 discovery) |
 | `internal/proxy`   | Маршрутизация JSON-RPC между transport и remote |
 | `main.go`          | Wire-up |

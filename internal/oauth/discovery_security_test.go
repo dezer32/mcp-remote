@@ -151,7 +151,7 @@ func TestHandleUnauthorizedBadAuthorizationEndpointDoesNotOpenBrowser(t *testing
 		AllowHTTP:   true,
 	}, opener, logging.Discard())
 
-	err := p.HandleUnauthorized(context.Background(), "")
+	err := handleUnauthorized(p, "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -407,7 +407,7 @@ func TestHandleUnauthorizedIssuerMismatchDoesNotOpenBrowser(t *testing.T) {
 		AuthTimeout: time.Second, AllowHTTP: true,
 	}, opener, logging.Discard())
 
-	if err := p.HandleUnauthorized(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "issuer") {
+	if err := handleUnauthorized(p, ""); err == nil || !strings.Contains(err.Error(), "issuer") {
 		t.Fatalf("err = %v, want issuer error", err)
 	}
 	select {

@@ -18,10 +18,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dezer32/mcp-remote/internal/config"
 	"github.com/dezer32/mcp-remote/internal/jsonrpc"
 	"github.com/dezer32/mcp-remote/internal/proxy"
+	"github.com/dezer32/mcp-remote/internal/wwwauth"
 )
 
 // TokenProvider абстрагирует получение Authorization для каждого запроса.
@@ -30,10 +32,13 @@ import (
 type TokenProvider interface {
 	// Token возвращает текущий access-токен. "" → заголовок не ставится.
 	Token(ctx context.Context) (string, error)
-	// HandleUnauthorized вызывается на HTTP 401. wwwAuthenticate — точное
+	// HandleUnauthorized обрабатывает 401 на запрос, ушедший с rejectedToken
+	// ("" — токен провайдера не отправлялся). wwwAuthenticate — точное
 	// значение заголовка WWW-Authenticate из ответа (может быть пустым).
-	// На успех (новый токен/новая сессия) httpmcp выполнит однократный retry.
-	HandleUnauthorized(ctx context.Context, wwwAuthenticate string) error
+	// allowRefresh=false запрещает refresh: предыдущий шаг этой же цепочки
+	// уже дал токен, и его отвергли. authorized=true — был пройден полный
+	// флоу авторизации в браузере. На успех httpmcp повторяет запрос.
+	HandleUnauthorized(ctx context.Context, wwwAuthenticate, rejectedToken string, allowRefresh bool) (authorized bool, err error)
 }
 
 // Internal constants.
@@ -53,7 +58,21 @@ const (
 	// listenStableStream — сколько должен прожить GET SSE стрим, чтобы
 	// считаться стабильным и сбросить backoff перед reconnect-ом.
 	listenStableStream = 30 * time.Second
+
+	// maxAuthAttempts — сколько раз одна цепочка 401 (один POST или серия
+	// GET SSE до ответа 200) обращается к TokenProvider.HandleUnauthorized.
+	// Запрос уходит не больше maxAuthAttempts+1 раз.
+	maxAuthAttempts = 3
+	// maxErrorDescriptionRunes — предел error_description из WWW-Authenticate
+	// в итоговой ошибке: значение приходит от недоверенного сервера.
+	maxErrorDescriptionRunes = 200
 )
+
+// authChain — состояние обработки 401 в рамках одного запроса.
+type authChain struct {
+	attempts   int  // вызовы HandleUnauthorized в этой цепочке
+	authorized bool // цепочка уже прошла полный флоу авторизации
+}
 
 // Client — Streamable HTTP клиент. Реализует proxy.Remote.
 type Client struct {
@@ -112,8 +131,10 @@ func (c *Client) httpClient() *http.Client {
 //
 // Возвращает снимок сессии, с которым уходит запрос: по нему ответ решает,
 // применять ли пришедший Mcp-Session-Id (extractSessionID) и считать ли 404
-// потерей сессии (emit404).
-func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withContentType bool) (sessionSnap, error) {
+// потерей сессии (emit404). Второе значение — токен, поставленный из
+// TokenProvider ("" если Authorization пришёл из --header или токена нет):
+// его handle401 передаёт провайдеру как отвергнутый.
+func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withContentType bool) (sessionSnap, string, error) {
 	for _, h := range c.cfg.Headers {
 		req.Header.Set(h.Name, h.Value)
 	}
@@ -131,16 +152,18 @@ func (c *Client) setRequestHeaders(ctx context.Context, req *http.Request, withC
 		req.Header.Set(headerProtocolVersion, pv)
 	}
 
+	var token string
 	if req.Header.Get("Authorization") == "" && c.tp != nil {
 		t, err := c.tp.Token(ctx)
 		if err != nil {
-			return snap, fmt.Errorf("token provider: %w", err)
+			return snap, "", fmt.Errorf("token provider: %w", err)
 		}
 		if t != "" {
 			req.Header.Set("Authorization", "Bearer "+t)
+			token = t
 		}
 	}
-	return snap, nil
+	return snap, token, nil
 }
 
 // extractSessionID читает Mcp-Session-Id из ответа и сохраняет, если валиден и
@@ -175,58 +198,61 @@ func (c *Client) Send(ctx context.Context, msg jsonrpc.Message) (<-chan proxy.Me
 			}
 			close(out)
 		}()
-		c.sendOnce(ctx, body, out, false)
+		c.doSend(ctx, body, out)
 	}()
 	return out, nil
 }
 
-// sendOnce выполняет один POST и обрабатывает ответ. На 401 — рекурсивно
-// вызывает себя с retried=true (это даёт ровно один retry).
+// doSend выполняет POST и обрабатывает ответ. На 401 запрос повторяется,
+// пока handle401 разрешает (цепочка authChain ограничена maxAuthAttempts).
 // НЕ закрывает out — caller отвечает за close.
-func (c *Client) sendOnce(ctx context.Context, body []byte, out chan<- proxy.MessageOrError, retried bool) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.ServerURL, bytes.NewReader(body))
-	if err != nil {
-		c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
-		return
-	}
-	snap, err := c.setRequestHeaders(ctx, req, true)
-	if err != nil {
-		c.emitErr(ctx, out, err)
-		return
-	}
-
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		c.emitErr(ctx, out, fmt.Errorf("http do: %w", err))
-		return
-	}
-
-	switch resp.StatusCode {
-	case http.StatusAccepted:
-		c.extractSessionID(resp, snap)
-		drainAndClose(resp.Body)
-		return
-
-	case http.StatusOK:
-		c.extractSessionID(resp, snap)
-		c.handleOK(ctx, resp, out)
-		return
-
-	case http.StatusUnauthorized:
-		if !c.handle401(ctx, resp, retried, out) {
+func (c *Client) doSend(ctx context.Context, body []byte, out chan<- proxy.MessageOrError) {
+	var chain authChain
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.ServerURL, bytes.NewReader(body))
+		if err != nil {
+			c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
 			return
 		}
-		c.sendOnce(ctx, body, out, true)
-		return
+		snap, sentToken, err := c.setRequestHeaders(ctx, req, true)
+		if err != nil {
+			c.emitErr(ctx, out, err)
+			return
+		}
 
-	case http.StatusNotFound:
-		c.emit404(ctx, resp, out, snap)
-		return
+		resp, err := c.httpClient().Do(req)
+		if err != nil {
+			c.emitErr(ctx, out, fmt.Errorf("http do: %w", err))
+			return
+		}
 
-	default:
-		excerpt := readBodyExcerpt(resp.Body)
-		resp.Body.Close()
-		c.emitErr(ctx, out, fmt.Errorf("http %d: %s", resp.StatusCode, excerpt))
+		switch resp.StatusCode {
+		case http.StatusAccepted:
+			c.extractSessionID(resp, snap)
+			drainAndClose(resp.Body)
+			return
+
+		case http.StatusOK:
+			c.extractSessionID(resp, snap)
+			c.handleOK(ctx, resp, out)
+			return
+
+		case http.StatusUnauthorized:
+			if !c.handle401(ctx, req, resp, &chain, sentToken, out) {
+				return
+			}
+			continue
+
+		case http.StatusNotFound:
+			c.emit404(ctx, resp, out, snap)
+			return
+
+		default:
+			excerpt := readBodyExcerpt(resp.Body)
+			resp.Body.Close()
+			c.emitErr(ctx, out, fmt.Errorf("http %d: %s", resp.StatusCode, excerpt))
+			return
+		}
 	}
 }
 
@@ -295,7 +321,7 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 	var (
 		lastEventID string
 		backoff     time.Duration // 0 → первый retry без задержки
-		retried401  bool
+		chain       authChain     // цепочка 401, сбрасывается на 200
 	)
 
 	setLastID := func(id string) {
@@ -311,7 +337,7 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			c.emitErr(ctx, out, fmt.Errorf("new request: %w", err))
 			return
 		}
-		snap, err := c.setRequestHeaders(ctx, req, false)
+		snap, sentToken, err := c.setRequestHeaders(ctx, req, false)
 		if err != nil {
 			c.emitErr(ctx, out, err)
 			return
@@ -339,10 +365,9 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 			return
 
 		case http.StatusUnauthorized:
-			if !c.handle401(ctx, resp, retried401, out) {
+			if !c.handle401(ctx, req, resp, &chain, sentToken, out) {
 				return
 			}
-			retried401 = true
 			continue
 
 		case http.StatusNotFound:
@@ -351,7 +376,7 @@ func (c *Client) doListen(ctx context.Context, out chan<- proxy.MessageOrError) 
 
 		case http.StatusOK:
 			c.extractSessionID(resp, snap)
-			retried401 = false
+			chain = authChain{}
 			ct := resp.Header.Get("Content-Type")
 			mediaType, _, mtErr := mime.ParseMediaType(ct)
 			if mtErr != nil || mediaType != contentTypeSSE {
@@ -458,7 +483,7 @@ func (c *Client) Close(ctx context.Context) error {
 		return nil
 	}
 	// Снимок сессии DELETE-у не нужен: ответ сессию не меняет.
-	if _, err = c.setRequestHeaders(delCtx, req, false); err != nil {
+	if _, _, err = c.setRequestHeaders(delCtx, req, false); err != nil {
 		c.log.Warn("close: set headers", slog.String("err", err.Error()))
 		return nil
 	}
@@ -479,25 +504,71 @@ func (c *Client) Close(ctx context.Context) error {
 	return nil
 }
 
-// handle401 — общая обработка 401: парс WWW-Authenticate, вызов tp.HandleUnauthorized,
-// emit ошибки на провал. Закрывает resp.Body. Возвращает true если caller-у можно
-// повторить запрос (один раз — retried контролирует), иначе false (ошибка уже emit-нута).
-func (c *Client) handle401(ctx context.Context, resp *http.Response, retried bool, out chan<- proxy.MessageOrError) bool {
+// handle401 — общая обработка 401 для POST и GET SSE. Закрывает resp.Body.
+// Пишет debug-лог с причиной отказа из WWW-Authenticate и решает, можно ли
+// повторить запрос:
+//   - цепочка уже прошла полный флоу авторизации — ошибка без нового флоу;
+//   - исчерпан лимит maxAuthAttempts — ошибка;
+//   - иначе HandleUnauthorized с отвергнутым токеном; refresh разрешён только
+//     на первом шаге цепочки (дальше отвергнут токен, выданный этой цепочкой).
+//
+// Возвращает true, если caller-у можно повторить запрос, иначе false (ошибка
+// уже emit-нута). sentToken — токен провайдера, с которым ушёл req.
+func (c *Client) handle401(ctx context.Context, req *http.Request, resp *http.Response, chain *authChain, sentToken string, out chan<- proxy.MessageOrError) bool {
 	www := resp.Header.Get("WWW-Authenticate")
 	drainAndClose(resp.Body)
-	if retried {
-		c.emitErr(ctx, out, fmt.Errorf("http 401 after retry"))
+
+	params := wwwauth.ParseBearer(www)
+	errCode := params["error"]
+	errDesc := truncateRunes(params["error_description"], maxErrorDescriptionRunes)
+	c.log.Debug("remote 401",
+		slog.String("method", req.Method),
+		slog.Int("attempt", chain.attempts+1),
+		slog.Bool("token_sent", req.Header.Get("Authorization") != ""),
+		slog.String("error", errCode),
+		slog.String("error_description", errDesc))
+
+	if chain.authorized {
+		c.emitErr(ctx, out, unauthorizedError("token rejected right after authorization", errCode, errDesc))
+		return false
+	}
+	if chain.attempts >= maxAuthAttempts {
+		c.emitErr(ctx, out, unauthorizedError(fmt.Sprintf("giving up after %d authorization attempts", maxAuthAttempts), errCode, errDesc))
 		return false
 	}
 	if c.tp == nil {
-		c.emitErr(ctx, out, fmt.Errorf("http 401: no token provider"))
+		c.emitErr(ctx, out, unauthorizedError("no token provider", errCode, errDesc))
 		return false
 	}
-	if err := c.tp.HandleUnauthorized(ctx, www); err != nil {
+	authorized, err := c.tp.HandleUnauthorized(ctx, www, sentToken, chain.attempts == 0)
+	chain.attempts++
+	if err != nil {
 		c.emitErr(ctx, out, fmt.Errorf("handle unauthorized: %w", err))
 		return false
 	}
+	chain.authorized = authorized
 	return true
+}
+
+// unauthorizedError — итоговая ошибка 401:
+// "http 401: <причина>[: <error>][: <error_description>]".
+func unauthorizedError(reason, errCode, errDesc string) error {
+	msg := "http 401: " + reason
+	if errCode != "" {
+		msg += ": " + errCode
+	}
+	if errDesc != "" {
+		msg += ": " + errDesc
+	}
+	return errors.New(msg)
+}
+
+// truncateRunes обрезает s до n рун, не разрывая UTF-8 последовательности.
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
 }
 
 // emit404 — общая обработка 404. ErrSessionLost, если запрос ушёл с session id

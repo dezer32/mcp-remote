@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dezer32/mcp-remote/internal/config"
 	"github.com/dezer32/mcp-remote/internal/jsonrpc"
@@ -25,9 +27,18 @@ type fakeTP struct {
 	token          string
 	tokenErr       error
 	onUnauth       func(ctx context.Context, www string) error
+	onUnauthCall   func(ctx context.Context, call unauthCall) (bool, error)
 	unauthCalled   int
 	lastUnauthArg  string
+	unauthCalls    []unauthCall
 	tokenCallCount int
+}
+
+// unauthCall — аргументы одного вызова HandleUnauthorized.
+type unauthCall struct {
+	www          string
+	rejected     string
+	allowRefresh bool
 }
 
 func (f *fakeTP) Token(ctx context.Context) (string, error) {
@@ -37,16 +48,34 @@ func (f *fakeTP) Token(ctx context.Context) (string, error) {
 	return f.token, f.tokenErr
 }
 
-func (f *fakeTP) HandleUnauthorized(ctx context.Context, www string) error {
+func (f *fakeTP) HandleUnauthorized(ctx context.Context, www, rejectedToken string, allowRefresh bool) (bool, error) {
+	call := unauthCall{www: www, rejected: rejectedToken, allowRefresh: allowRefresh}
 	f.mu.Lock()
 	f.unauthCalled++
 	f.lastUnauthArg = www
+	f.unauthCalls = append(f.unauthCalls, call)
 	cb := f.onUnauth
+	cbCall := f.onUnauthCall
 	f.mu.Unlock()
-	if cb != nil {
-		return cb(ctx, www)
+	if cbCall != nil {
+		return cbCall(ctx, call)
 	}
-	return nil
+	if cb != nil {
+		return false, cb(ctx, www)
+	}
+	return false, nil
+}
+
+func (f *fakeTP) calls() []unauthCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]unauthCall(nil), f.unauthCalls...)
+}
+
+func (f *fakeTP) setToken(tok string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.token = tok
 }
 
 func (f *fakeTP) snapshot() (int, string, int) {
@@ -287,29 +316,230 @@ func TestSend_401_Recover(t *testing.T) {
 	}
 }
 
-// --- 9. POST → 401 → success TP → retry → 401 (no double-retry) ---
-func TestSend_401_RetryFails(t *testing.T) {
+// --- 9. POST → remote всегда 401 → цепочка упирается в maxAuthAttempts ---
+func TestSend_401_AlwaysGivesUp(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
-		w.Header().Set("WWW-Authenticate", "Bearer")
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
-	tp := &fakeTP{}
+	tp := &fakeTP{token: "tok"}
 	c := newClient(t, srv.URL, tp)
 	ch, _ := c.Send(context.Background(), request(1, "ping"))
 	got := collect(t, ch, 2*time.Second)
 	if len(got) != 1 || got[0].Err == nil {
 		t.Fatalf("expected single err, got %+v", got)
 	}
+	msg := got[0].Err.Error()
+	if !strings.Contains(msg, "giving up after 3 authorization attempts") || !strings.Contains(msg, "invalid_token") {
+		t.Errorf("err = %q", msg)
+	}
 	uc, _, _ := tp.snapshot()
-	if uc != 1 {
+	if uc != maxAuthAttempts {
+		t.Errorf("unauthCalled=%d, want %d", uc, maxAuthAttempts)
+	}
+	if n := atomic.LoadInt32(&calls); n > 4 {
+		t.Errorf("server hits=%d, want <= 4", n)
+	}
+	steps := tp.calls()
+	if !steps[0].allowRefresh || steps[1].allowRefresh || steps[2].allowRefresh {
+		t.Errorf("allowRefresh must be true only on the first step: %+v", steps)
+	}
+}
+
+// --- 9a. 401 → refresh → 401 → полный флоу (allowRefresh=false) → 200 ---
+func TestSend_401_RefreshRejectedThenAuthorize(t *testing.T) {
+	var hits int32
+	body, _ := jsonrpc.Encode(responseMsg(1, "ok"))
+	var mu sync.Mutex
+	var sentAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		mu.Lock()
+		sentAuth = append(sentAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if n <= 2 {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	tp := &fakeTP{token: "B"}
+	tp.onUnauthCall = func(_ context.Context, call unauthCall) (bool, error) {
+		if call.allowRefresh {
+			tp.setToken("B2") // refresh
+			return false, nil
+		}
+		tp.setToken("C") // полный флоу
+		return true, nil
+	}
+	c := newClient(t, srv.URL, tp)
+	ch, _ := c.Send(context.Background(), request(1, "ping"))
+	got := collect(t, ch, 2*time.Second)
+	if len(got) != 1 || got[0].Err != nil {
+		t.Fatalf("expected single msg, got %+v", got)
+	}
+	calls := tp.calls()
+	want := []unauthCall{
+		{www: `Bearer error="invalid_token"`, rejected: "B", allowRefresh: true},
+		{www: `Bearer error="invalid_token"`, rejected: "B2", allowRefresh: false},
+	}
+	if len(calls) != len(want) || calls[0] != want[0] || calls[1] != want[1] {
+		t.Fatalf("calls = %+v, want %+v", calls, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sentAuth) != 3 || sentAuth[2] != "Bearer C" {
+		t.Fatalf("sent Authorization = %v", sentAuth)
+	}
+}
+
+// --- 9b. Токен, выданный полным флоу, тоже отвергнут → ошибка без нового флоу ---
+func TestSend_401_RejectedRightAfterAuthorization(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="token revoked"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	tp := &fakeTP{onUnauthCall: func(context.Context, unauthCall) (bool, error) { return true, nil }}
+	c := newClient(t, srv.URL, tp)
+	ch, _ := c.Send(context.Background(), request(1, "ping"))
+	got := collect(t, ch, 2*time.Second)
+	if len(got) != 1 || got[0].Err == nil {
+		t.Fatalf("expected single err, got %+v", got)
+	}
+	want := "http 401: token rejected right after authorization: invalid_token: token revoked"
+	if got[0].Err.Error() != want {
+		t.Errorf("err = %q, want %q", got[0].Err, want)
+	}
+	if uc, _, _ := tp.snapshot(); uc != 1 {
 		t.Errorf("unauthCalled=%d, want 1", uc)
 	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
+	if n := atomic.LoadInt32(&hits); n != 2 {
 		t.Errorf("server hits=%d, want 2", n)
 	}
+}
+
+// --- 9c. rejectedToken — отправленный Bearer провайдера; при --header — "" ---
+func TestSend_401_RejectedTokenArgument(t *testing.T) {
+	newSrv := func() *httptest.Server {
+		var n int32
+		body, _ := jsonrpc.Encode(responseMsg(1, "ok"))
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if atomic.AddInt32(&n, 1) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(body)
+		}))
+	}
+
+	t.Run("provider token", func(t *testing.T) {
+		srv := newSrv()
+		defer srv.Close()
+		tp := &fakeTP{token: "tok-1"}
+		ch, _ := newClient(t, srv.URL, tp).Send(context.Background(), request(1, "ping"))
+		collect(t, ch, 2*time.Second)
+		if calls := tp.calls(); len(calls) != 1 || calls[0].rejected != "tok-1" {
+			t.Fatalf("calls = %+v, want rejected=tok-1", calls)
+		}
+	})
+	t.Run("user Authorization header", func(t *testing.T) {
+		srv := newSrv()
+		defer srv.Close()
+		tp := &fakeTP{token: "tok-1"}
+		c := newClient(t, srv.URL, tp, config.Header{Name: "Authorization", Value: "Bearer external"})
+		ch, _ := c.Send(context.Background(), request(1, "ping"))
+		collect(t, ch, 2*time.Second)
+		if calls := tp.calls(); len(calls) != 1 || calls[0].rejected != "" {
+			t.Fatalf("calls = %+v, want rejected=\"\"", calls)
+		}
+	})
+}
+
+// --- 9d. error_description в итоговой ошибке усечён до 200 рун ---
+func TestSend_401_ErrorDescriptionTruncated(t *testing.T) {
+	desc := strings.Repeat("aя", 250) // 500 рун, половина — двухбайтовые
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+desc+`"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	tp := &fakeTP{onUnauthCall: func(context.Context, unauthCall) (bool, error) { return true, nil }}
+	ch, _ := newClient(t, srv.URL, tp).Send(context.Background(), request(1, "ping"))
+	got := collect(t, ch, 2*time.Second)
+	if len(got) != 1 || got[0].Err == nil {
+		t.Fatalf("expected single err, got %+v", got)
+	}
+	msg := got[0].Err.Error()
+	if !utf8.ValidString(msg) {
+		t.Fatalf("error is not valid UTF-8: %q", msg)
+	}
+	prefix := "http 401: token rejected right after authorization: invalid_token: "
+	if !strings.HasPrefix(msg, prefix) {
+		t.Fatalf("err = %q", msg)
+	}
+	gotDesc := strings.TrimPrefix(msg, prefix)
+	if n := utf8.RuneCountInString(gotDesc); n != maxErrorDescriptionRunes {
+		t.Fatalf("description has %d runes, want %d", n, maxErrorDescriptionRunes)
+	}
+	if gotDesc != strings.Repeat("aя", 100) {
+		t.Fatalf("description = %q", gotDesc)
+	}
+}
+
+// --- 9e. Debug-лог на каждый 401: причина и признак токена, без значения ---
+func TestSend_401_DebugLog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="expired"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	var buf syncBuffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	tp := &fakeTP{token: "secret-token-value", onUnauthCall: func(context.Context, unauthCall) (bool, error) { return true, nil }}
+	c, err := New(&config.Config{ServerURL: srv.URL}, tp, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, _ := c.Send(context.Background(), request(1, "ping"))
+	collect(t, ch, 2*time.Second)
+	out := buf.String()
+	for _, want := range []string{`msg="remote 401"`, "method=POST", "attempt=1", "attempt=2", "token_sent=true", "error=invalid_token", "error_description=expired"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log has no %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "secret-token-value") {
+		t.Errorf("log contains token value:\n%s", out)
+	}
+}
+
+// syncBuffer — потокобезопасный буфер для захвата slog-вывода.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // --- 10. POST → 401 без WWW-Authenticate ---
@@ -1302,5 +1532,68 @@ func TestSend_404_SentWithoutSession_StaysHTTPError(t *testing.T) {
 	}
 	if !strings.Contains(got[0].Err.Error(), "http 404") {
 		t.Fatalf("err=%v, want http 404", got[0].Err)
+	}
+}
+
+// GET SSE: 401 → refresh → 401 → authorize → 200; после 200 цепочка
+// сбрасывается, и следующий 401 снова начинается с allowRefresh=true.
+func TestListen_401ChainResetsOn200(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch n.Add(1) {
+		case 1, 2, 4:
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		case 3:
+			// Стрим с одним событием, затем закрытие → reconnect.
+			sseHeaders(w)
+			fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/one\"}\n\n")
+			return
+		}
+		sseHeaders(w)
+		fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/two\"}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	tp := &fakeTP{token: "B"}
+	tp.onUnauthCall = func(_ context.Context, call unauthCall) (bool, error) {
+		return !call.allowRefresh, nil // refresh на первом шаге, дальше полный флоу
+	}
+	c := newClient(t, srv.URL, tp)
+	setBackoff(c, 10*time.Millisecond, 50*time.Millisecond, time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, _ := c.Listen(ctx)
+	for _, want := range []string{"notifications/one", "notifications/two"} {
+		select {
+		case moe, ok := <-ch:
+			if !ok {
+				t.Fatalf("channel closed before %s", want)
+			}
+			if moe.Err != nil || moe.Msg.Method != want {
+				t.Fatalf("got %+v, want %s", moe, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no %s", want)
+		}
+	}
+	cancel()
+	collect(t, ch, 2*time.Second)
+
+	got := tp.calls()
+	wantAllow := []bool{true, false, true}
+	if len(got) != len(wantAllow) {
+		t.Fatalf("calls = %+v, want %d", got, len(wantAllow))
+	}
+	for i, w := range wantAllow {
+		if got[i].allowRefresh != w {
+			t.Fatalf("call %d allowRefresh=%v, want %v (calls %+v)", i, got[i].allowRefresh, w, got)
+		}
 	}
 }

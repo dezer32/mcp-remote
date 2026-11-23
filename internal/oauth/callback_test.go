@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +16,7 @@ import (
 
 func TestCallbackSuccess(t *testing.T) {
 	cfg := &config.Config{}
-	url, srv, err := listenCallback(cfg, "GOOD")
+	url, srv, err := listenCallback(cfg, "GOOD", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -43,7 +45,7 @@ func TestCallbackSuccess(t *testing.T) {
 
 func TestCallbackErrorParam(t *testing.T) {
 	cfg := &config.Config{}
-	url, srv, err := listenCallback(cfg, "anything")
+	url, srv, err := listenCallback(cfg, "anything", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -72,7 +74,7 @@ func TestCallbackErrorParam(t *testing.T) {
 // error без state (или с чужим) — 400, ожидание не завершается.
 func TestCallbackErrorWithoutStateIsIgnored(t *testing.T) {
 	cfg := &config.Config{}
-	url, srv, err := listenCallback(cfg, "EXPECTED")
+	url, srv, err := listenCallback(cfg, "EXPECTED", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -106,7 +108,7 @@ func TestCallbackErrorWithoutStateIsIgnored(t *testing.T) {
 // Неверный state не срывает флоу: следом пришедший верный callback успешен.
 func TestCallbackStateMismatch(t *testing.T) {
 	cfg := &config.Config{}
-	url, srv, err := listenCallback(cfg, "EXPECTED")
+	url, srv, err := listenCallback(cfg, "EXPECTED", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -143,7 +145,7 @@ func TestCallbackStateMismatch(t *testing.T) {
 // Не-GET — 405 с Allow: GET, ожидание продолжается.
 func TestCallbackNonGetMethod(t *testing.T) {
 	cfg := &config.Config{}
-	url, srv, err := listenCallback(cfg, "S")
+	url, srv, err := listenCallback(cfg, "S", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -172,7 +174,7 @@ func TestCallbackNonGetMethod(t *testing.T) {
 
 func TestCallbackMissingCode(t *testing.T) {
 	cfg := &config.Config{}
-	url, srv, err := listenCallback(cfg, "S")
+	url, srv, err := listenCallback(cfg, "S", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -194,7 +196,7 @@ func TestCallbackMissingCode(t *testing.T) {
 
 func TestCallbackContextTimeout(t *testing.T) {
 	cfg := &config.Config{}
-	_, srv, err := listenCallback(cfg, "S")
+	_, srv, err := listenCallback(cfg, "S", 0, nil)
 	if err != nil {
 		t.Fatalf("listenCallback: %v", err)
 	}
@@ -236,5 +238,98 @@ func TestIsLoopbackHost(t *testing.T) {
 		if got := isLoopbackHost(tc.host); got != tc.want {
 			t.Errorf("isLoopbackHost(%q) = %v, want %v", tc.host, got, tc.want)
 		}
+	}
+}
+
+func TestRegisteredCallbackPort(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		uris []string
+		want int
+	}{
+		{"default host", "", []string{"http://127.0.0.1:62505/callback"}, 62505},
+		{"host case-insensitive", "LocalHost", []string{"http://localhost:8080/callback"}, 8080},
+		{"localhost is not 127.0.0.1", "127.0.0.1", []string{"http://localhost:8080/callback"}, 0},
+		{"ipv6 without brackets", "::1", []string{"http://[::1]:9000/callback"}, 9000},
+		{"ipv6 with brackets", "[::1]", []string{"http://[::1]:9000/callback"}, 9000},
+		{"foreign path", "", []string{"http://127.0.0.1:8080/cb"}, 0},
+		{"https scheme", "", []string{"https://127.0.0.1:8080/callback"}, 0},
+		{"non-numeric port", "", []string{"http://127.0.0.1:abc/callback"}, 0},
+		{"no port", "", []string{"http://127.0.0.1/callback"}, 0},
+		{"second uri matches", "", []string{"https://app.example/callback", "http://127.0.0.1:7000/callback"}, 7000},
+		{"empty", "", nil, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := registeredCallbackPort(tc.host, tc.uris); got != tc.want {
+				t.Fatalf("registeredCallbackPort(%q, %v) = %d, want %d", tc.host, tc.uris, got, tc.want)
+			}
+		})
+	}
+}
+
+// freePort возвращает порт, который только что был свободен.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// holdPort занимает порт на время теста.
+func holdPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestCallbackPreferredPortFree(t *testing.T) {
+	port := freePort(t)
+	u, srv, err := listenCallback(&config.Config{}, "S", port, nil)
+	if err != nil {
+		t.Fatalf("listenCallback: %v", err)
+	}
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+	if want := "http://127.0.0.1:" + strconv.Itoa(port) + "/callback"; u != want {
+		t.Fatalf("url = %q, want %q", u, want)
+	}
+}
+
+func TestCallbackPreferredPortBusyFallsBack(t *testing.T) {
+	port := holdPort(t)
+	u, srv, err := listenCallback(&config.Config{}, "S", port, nil)
+	if err != nil {
+		t.Fatalf("listenCallback: %v", err)
+	}
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+	if strings.Contains(u, ":"+strconv.Itoa(port)+"/") {
+		t.Fatalf("url = %q uses the busy port", u)
+	}
+}
+
+func TestCallbackExplicitPortWinsAndBusyFails(t *testing.T) {
+	explicit := freePort(t)
+	preferred := freePort(t)
+	u, srv, err := listenCallback(&config.Config{Port: explicit}, "S", preferred, nil)
+	if err != nil {
+		t.Fatalf("listenCallback: %v", err)
+	}
+	_ = srv.Shutdown(context.Background())
+	if !strings.Contains(u, ":"+strconv.Itoa(explicit)+"/") {
+		t.Fatalf("url = %q, want explicit port %d", u, explicit)
+	}
+
+	busy := holdPort(t)
+	if _, _, err := listenCallback(&config.Config{Port: busy}, "S", 0, nil); err == nil {
+		t.Fatal("expected error for busy explicit port")
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -46,6 +47,22 @@ type FakeServer struct {
 	// OAuth mode.
 	oauthMode     bool
 	requireBearer string
+
+	// clients — зарегистрированные через /register клиенты: client_id →
+	// redirect_uris. registrations — число вызовов /register.
+	clients       map[string][]string
+	registrations int
+	// strictRedirectURI — /authorize отвечает 400 invalid_request, если
+	// redirect_uri не входит в зарегистрированные для client_id.
+	strictRedirectURI bool
+	// rejectRefreshed — токены, выданные по refresh_token, ресурс отвергает
+	// (401 error="invalid_token"): имитация протухшего grant-а.
+	rejectRefreshed bool
+	refreshGrants   int
+	// rejectAll — ресурс отвергает любой токен, включая выданные по
+	// authorization_code. authorizeHits — число запросов к /authorize.
+	rejectAll     bool
+	authorizeHits int
 }
 
 // NewFakeServer создаёт сервер без OAuth.
@@ -66,6 +83,7 @@ func newFakeServer(t *testing.T, oauthMode bool) *FakeServer {
 	s := &FakeServer{
 		oauthMode: oauthMode,
 		expired:   make(map[string]bool),
+		clients:   make(map[string][]string),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", s.handleMCP)
@@ -117,6 +135,58 @@ func (s *FakeServer) GrantToken(token string) {
 	s.requireBearer = token
 }
 
+// SetStrictRedirectURI включает строгую проверку redirect_uri в /authorize.
+func (s *FakeServer) SetStrictRedirectURI(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.strictRedirectURI = on
+}
+
+// SetRejectRefreshedTokens включает режим, в котором токены, выданные по
+// refresh_token, ресурс отвергает с error="invalid_token".
+func (s *FakeServer) SetRejectRefreshedTokens(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejectRefreshed = on
+}
+
+// SetRejectAllTokens включает режим, в котором ресурс отвергает любой
+// токен (401 error="invalid_token"), даже только что выданный.
+func (s *FakeServer) SetRejectAllTokens(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejectAll = on
+}
+
+// AuthorizeCount — число запросов к /authorize (открытий «браузера»).
+func (s *FakeServer) AuthorizeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.authorizeHits
+}
+
+// RegisterClient регистрирует клиента напрямую (как будто через /register в
+// прошлом запуске), не увеличивая счётчик регистраций.
+func (s *FakeServer) RegisterClient(clientID string, redirectURIs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients[clientID] = append([]string(nil), redirectURIs...)
+}
+
+// RegistrationCount — число вызовов /register.
+func (s *FakeServer) RegistrationCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registrations
+}
+
+// RefreshGrantCount — число успешных grant_type=refresh_token.
+func (s *FakeServer) RefreshGrantCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshGrants
+}
+
 // SeenProtocolVersion возвращает последний MCP-Protocol-Version, увиденный
 // сервером в заголовке запроса.
 func (s *FakeServer) SeenProtocolVersion() string {
@@ -160,26 +230,22 @@ func (s *FakeServer) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// OAuth: требуем Bearer перед обработкой тела.
+	// OAuth: требуем Bearer перед обработкой тела. До grant-а (requireBearer
+	// пуст) отвергается любой запрос — клиент стартует OAuth-flow.
 	if s.oauthMode {
 		s.mu.Lock()
 		req := s.requireBearer
 		s.mu.Unlock()
-		if req != "" {
-			auth := r.Header.Get("Authorization")
-			if auth != "Bearer "+req {
-				w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-					`Bearer realm="x", resource_metadata="%s/.well-known/oauth-protected-resource"`,
-					s.URL,
-				))
-				w.WriteHeader(http.StatusUnauthorized)
-				return
+		auth := r.Header.Get("Authorization")
+		if req == "" || auth != "Bearer "+req {
+			// С токеном — invalid_token (RFC 6750 §3.1), без — только challenge.
+			errParam := ""
+			if auth != "" {
+				errParam = `, error="invalid_token", error_description="The access token is invalid"`
 			}
-		} else {
-			// До grantToken — отдаём 401 c PRM-challenge, чтобы клиент стартанул OAuth-flow.
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-				`Bearer realm="x", resource_metadata="%s/.well-known/oauth-protected-resource"`,
-				s.URL,
+				`Bearer realm="x", resource_metadata="%s/.well-known/oauth-protected-resource"%s`,
+				s.URL, errParam,
 			))
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -409,11 +475,25 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var body struct {
+		RedirectURIs []string `json:"redirect_uris"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad registration body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	s.registrations++
+	clientID := fmt.Sprintf("test-client-%d", s.registrations)
+	s.clients[clientID] = body.RedirectURIs
+	s.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"client_id":                  "test-client",
+		"client_id":                  clientID,
 		"client_id_issued_at":        time.Now().Unix(),
 		"token_endpoint_auth_method": "none",
+		"redirect_uris":              body.RedirectURIs,
 	})
 }
 
@@ -422,6 +502,9 @@ func (s *FakeServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.mu.Lock()
+	s.authorizeHits++
+	s.mu.Unlock()
 	q := r.URL.Query()
 	redirectURI := q.Get("redirect_uri")
 	state := q.Get("state")
@@ -432,6 +515,19 @@ func (s *FakeServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		http.Error(w, "bad redirect_uri", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	strict := s.strictRedirectURI
+	registered, known := s.clients[q.Get("client_id")]
+	s.mu.Unlock()
+	if strict && (!known || !slices.Contains(registered, redirectURI)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_request",
+			"error_description": "The specified 'redirect_uri' is not valid for this client application",
+		})
 		return
 	}
 	qs := u.Query()
@@ -467,8 +563,25 @@ func (s *FakeServer) handleToken(w http.ResponseWriter, r *http.Request) {
 	case "authorization_code":
 		resp["access_token"] = "test-token"
 		resp["refresh_token"] = "refresh-x"
-		s.GrantToken("test-token")
+		s.mu.Lock()
+		rejectAll := s.rejectAll
+		s.mu.Unlock()
+		if !rejectAll {
+			s.GrantToken("test-token")
+		}
 	case "refresh_token":
+		s.mu.Lock()
+		s.refreshGrants++
+		n := s.refreshGrants
+		reject := s.rejectRefreshed
+		s.mu.Unlock()
+		if reject {
+			// Refresh «проходит», но ресурс такой токен не примет: requireBearer
+			// не меняется. refresh_token принимается повторно.
+			resp["access_token"] = fmt.Sprintf("refreshed-token-%d", n)
+			resp["refresh_token"] = "refresh-stale"
+			break
+		}
 		resp["access_token"] = "test-token-2"
 		resp["refresh_token"] = "refresh-y"
 		s.GrantToken("test-token-2")

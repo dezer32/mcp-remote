@@ -77,7 +77,7 @@ func TestHandleUnauthorizedUnsafeURLAbortsFlow(t *testing.T) {
 
 	var err error
 	stderr := captureStderr(t, func() {
-		err = p.HandleUnauthorized(context.Background(), as.wwwAuthenticate())
+		err = handleUnauthorized(p, as.wwwAuthenticate())
 	})
 	if err == nil {
 		t.Fatal("HandleUnauthorized: expected error")
@@ -116,7 +116,7 @@ func TestHandleUnauthorizedOtherOpenerErrorPrintsURL(t *testing.T) {
 
 	var err error
 	stderr := captureStderr(t, func() {
-		err = p.HandleUnauthorized(context.Background(), as.wwwAuthenticate())
+		err = handleUnauthorized(p, as.wwwAuthenticate())
 	})
 	if err == nil {
 		t.Fatal("expected callback timeout error")
@@ -186,7 +186,7 @@ func TestStoredHTTPTokenEndpointFallsBackToFullFlow(t *testing.T) {
 		t.Fatalf("SaveMetadata: %v", err)
 	}
 
-	err := p.HandleUnauthorized(context.Background(), "")
+	err := handleUnauthorized(p, "")
 	if err == nil || !strings.Contains(err.Error(), "discovery") {
 		t.Fatalf("err = %v, want full-flow discovery error", err)
 	}
@@ -211,7 +211,7 @@ func callbackHostWarned(t *testing.T, host string) bool {
 		AllowHTTP:   true,
 		Host:        host,
 	}, newErrOpener(errUnsafeURL), log) // opener сразу прерывает флоу после listen
-	_ = p.HandleUnauthorized(context.Background(), as.wwwAuthenticate())
+	_ = handleUnauthorized(p, as.wwwAuthenticate())
 	return strings.Contains(buf.String(), "non-loopback")
 }
 

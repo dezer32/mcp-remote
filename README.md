@@ -127,8 +127,14 @@ mcp-remote <server-url> [port] [flags]
 | `--config-dir` | `<path>` | Root directory for token and OAuth metadata storage. |
 
 Positional arguments: the first is the required remote MCP server URL;
-the second (optional) is the desired port for the local callback server.
-If omitted or `0`, the OS picks the port.
+the second (optional) is the port for the local OAuth callback server.
+If omitted or `0`, mcp-remote reuses the port from the `redirect_uris` of
+the stored (or `--static-oauth-client-info`) client, so the
+`redirect_uri` stays the one the authorization server knows. If that port
+is taken by another process, the OS picks a free port and a client
+obtained by dynamic registration is registered again with the new
+callback URL. An explicit port always wins; if it is taken, authorization
+fails.
 
 ## Environment variables
 
@@ -145,14 +151,26 @@ automatically launches the OAuth flow:
 1. Parses `WWW-Authenticate` and/or performs RFC9728 protected-resource
    discovery to locate the Authorization Server.
 2. Performs RFC8414 metadata discovery against the Authorization Server.
-3. If needed, performs RFC7591 Dynamic Client Registration (or uses the
-   data from `--static-oauth-client-info`).
-4. Starts a local HTTP server on `--host:port` to receive the callback.
+3. Starts a local HTTP server on `--host:port` to receive the callback.
+   Without an explicit port it reuses the port from the known client's
+   `redirect_uris` (falling back to a random port if it is taken).
+4. If needed, performs RFC7591 Dynamic Client Registration (or uses the
+   data from `--static-oauth-client-info`). A dynamically registered
+   client whose `redirect_uris` does not contain the current callback URL
+   is registered again before the browser opens (at most once per flow).
 5. Opens the user's browser at the authorization endpoint
    (PKCE S256, state, redirect_uri = `http://<host>:<port>/callback`).
 6. After a successful redirect, exchanges the `code` for access/refresh
    tokens.
 7. Persists tokens, client info, and server metadata to the config-dir.
+
+On a later `401` mcp-remote first tries the stored `refresh_token`. If the
+remote also rejects the refreshed token, mcp-remote drops the tokens and
+runs the full browser flow; if the token from the browser flow is
+rejected too, the request fails with
+`http 401: token rejected right after authorization: <error>: <description>`
+without opening the browser again. One request is retried at most three
+times after `401`.
 
 ### Token storage location
 
@@ -200,6 +218,22 @@ To reset everything at once, remove the entire root directory.
 - **Server does not support DCR** — register the client manually and
   pass `--static-oauth-client-info '{"client_id":"...","client_secret":"..."}'`
   (or `@/path/to/file.json`).
+- **`The specified 'redirect_uri' is not valid for this client application`**
+  (or another `invalid_request` about `redirect_uri` on the authorization
+  page) — the callback port differs from the one the client was
+  registered with. mcp-remote reuses the registered port and registers
+  the client again when it cannot; run with `--debug` and look for
+  `re-registering client` and its `reason`. For a
+  `--static-oauth-client-info` client registration is impossible: pass
+  the registered port as the second positional argument
+  (`mcp-remote https://example.com/mcp 62505`).
+- **`401` right after a token refresh** — the authorization server issues
+  tokens that the resource no longer accepts (e.g. the grant has
+  expired). mcp-remote then opens the browser by itself. To see why the
+  resource refuses the token, run
+  `mcp-remote https://example.com/mcp --debug 2>&1 | grep -E 'remote 401|token refreshed|token rejected|re-registering'`
+  and look at `error=` / `error_description=` and `token_sent=` in the
+  `remote 401` records.
 - **Reset stuck state** — delete the token directory for that server
   (see above) and restart the client.
 - **HTTP instead of HTTPS** — in a dev environment, pass `--allow-http`.
@@ -248,6 +282,7 @@ To reset everything at once, remove the entire root directory.
 | `internal/config`  | CLI flags, env vars, validation |
 | `internal/stdio`   | stdin/stdout transport |
 | `internal/httpmcp` | Streamable HTTP client to the remote MCP |
+| `internal/wwwauth` | `WWW-Authenticate` (Bearer) parsing |
 | `internal/oauth`   | OAuth 2.1 (PKCE + RFC7591 DCR + RFC9728/RFC8414 discovery) |
 | `internal/proxy`   | JSON-RPC routing between transport and remote |
 | `main.go`          | Wire-up |
